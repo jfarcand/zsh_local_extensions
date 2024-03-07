@@ -1,0 +1,43 @@
+#!/usr/bin/env zsh
+
+usage() {
+    echo "Usage: $0 <key> [namespace]"
+    echo "  - key: The key to search for in pod names."
+    echo "  - namespace: The Kubernetes namespace to search in (default: production)."
+}
+
+local key="$1"
+local namespace="${2:-production}" # Default to production if no namespace is provided
+local pod_names
+local selected_pods=()
+
+# Find the pod names based on the key
+pod_names=($(kubectl get pod -n "$namespace" | grep "$key" | awk '{print $1}'))
+
+if [[ ${#pod_names[@]} -eq 0 ]]; then
+echo "No pods found with key: $key in namespace: $namespace"
+return 1
+fi
+
+# Pass the count of pod_names to AppleScript
+local pod_count=${#pod_names[@]}
+
+osascript <<EOF
+tell application "iTerm"
+  tell current window
+    tell current session
+      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | zap-pretty"
+      if $pod_count > 1 then
+        split vertically with default profile
+        delay 1
+      end if
+    end tell
+    if $pod_count > 1 then
+      tell last session of current tab
+        write text "kubectl logs -n '$namespace' -f '${pod_names[2]}' | zap-pretty"
+      end tell
+    end if
+  end tell
+end tell
+EOF
+
