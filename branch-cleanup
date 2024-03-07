@@ -1,0 +1,28 @@
+#!/usr/bin/env zsh
+
+# Fetch the latest updates from the remote repository
+git fetch --prune
+
+# Get a list of all local branches
+local_branches=($(git branch | sed 's/^\*//'))
+
+# Iterate through each local branch and check if it has been deleted on the remote
+for branch in $local_branches; do
+    # Trim any leading whitespace
+    branch=${branch##*( )}
+
+    # Check if the branch has a corresponding remote-tracking branch
+    remote_branch=$(git for-each-ref --format='%(upstream:short)' refs/heads/"$branch")
+    
+    if [[ -n "$remote_branch" ]]; then
+        # Check if the remote-tracking branch has been deleted
+        if ! git rev-parse --verify --quiet "$remote_branch" >/dev/null; then
+            # If the remote-tracking branch has been deleted, delete the local branch
+            echo "Deleting local branch: $branch"
+            git branch -D "$branch"
+        fi
+    fi
+done
+
+echo "Local branches cleanup complete."
+
