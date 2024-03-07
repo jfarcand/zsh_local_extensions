@@ -1,0 +1,45 @@
+#!/usr/bin/env zsh
+
+usage() {
+    echo "Usage: $0 <key> [-n namespace]"
+    echo "  - key: The key to search for in pod names."
+    echo "  - namespace: The Kubernetes namespace to search in (default: production)."
+}
+
+# Default namespace
+local namespace="production"
+
+# Parse options
+while getopts ":n:" opt; do
+    case ${opt} in
+        n )
+            namespace=$OPTARG
+            ;;
+        \? )
+            usage
+            return 1
+            ;;
+    esac
+done
+shift $((OPTIND -1))
+
+local key="$1"
+
+if [[ -z "$key" ]]; then
+    echo "Error: Key is required."
+    usage
+    return 1
+fi
+
+local pod_names=($(kubectl get pods -n "$namespace" | grep "$key" | awk '{print $1}'))
+
+if [[ ${#pod_names[@]} -eq 0 ]]; then
+    echo "No pods found with key: $key in namespace: $namespace"
+    return 1
+fi
+
+# Describe each pod found
+for pod in "${pod_names[@]}"; do
+    kubectl describe pod -n "$namespace" "$pod"
+done
+

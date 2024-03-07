@@ -1,0 +1,50 @@
+#!/usr/bin/env zsh
+
+usage() {
+    echo "Usage: $0 <key> [-n namespace]"
+    echo "  - key: The key to search for in pod names and to find the image hash."
+    echo "  - namespace: The Kubernetes namespace to search in (default: production)."
+}
+
+# Default values
+local namespace="production"
+
+# Parse options
+while getopts ":n:" opt; do
+    case ${opt} in
+        n )
+            namespace=$OPTARG
+            ;;
+        \? )
+            usage
+            return 1
+            ;;
+    esac
+done
+shift $((OPTIND -1))
+
+local key="$1"
+
+if [[ -z "$key" ]]; then
+    echo "Error: Key is required."
+    usage
+    return 1
+fi
+
+# Find the pod names based on the key
+local pod_names=($(kubectl get pod -n "$namespace" | grep "$key" | awk '{print $1}'))
+
+if [[ ${#pod_names[@]} -eq 0 ]]; then
+    echo "No pods found with key: $key in namespace: $namespace"
+    return 1
+fi
+
+# Describe each pod found and parse the output for the Image line
+for pod in "${pod_names[@]}"; do
+    local image_line=$(kubectl describe pod -n "$namespace" "$pod" | grep "Image:" | grep "$key")
+    if [[ ! -z "$image_line" ]]; then
+        local image_hash=$(echo "$image_line" | awk -F "$key:" '{print $2}' | awk '{print $1}')
+        echo "$pod: $image_hash"
+    fi
+done
+
