@@ -2,9 +2,9 @@
 
 # Function to display usage information
 usage() {
-    echo "Usage: $0 -t <title> -b <message_body> [-f]"
+    echo "Usage: $0 -t <title> [-b <message_body>] [-f]"
     echo "  -t: Issue title"
-    echo "  -b: Issue body"
+    echo "  -b: Issue body (optional, defaults to title if not provided)"
     echo "  -f: Force push without confirmation"
     exit 1
 }
@@ -28,9 +28,14 @@ while getopts ":t:b:f" opt; do
     esac
 done
 
-# Check if both title and body are provided
-if [ -z "$title" ] || [ -z "$body" ]; then
+# Check if the title is provided
+if [ -z "$title" ]; then
     usage
+fi
+
+# Set body equal to title if body is empty
+if [ -z "$body" ]; then
+    body=$title
 fi
 
 # Check if there are changes to be committed
@@ -73,6 +78,6 @@ fi
 
 # Perform Git operations
 git add *
-git commit -m "Fixes #$issue_number"
+git commit -m "Fixes #$issue_number : $title"
 git push
 
