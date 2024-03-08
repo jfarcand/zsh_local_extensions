@@ -1,0 +1,58 @@
+#!/usr/bin/env zsh
+
+usage() {
+    echo "Usage: [namespace]"
+    echo "  - namespace: The Kubernetes namespace to search in (default: production)."
+}
+
+# Default values
+local namespace="${1:-production}" # Default to production if no namespace is provided
+local pod_names
+
+# Get all pod names in the namespace
+pod_names=($(kubectl get pod -n "$namespace" | awk 'NR>1 {print $1}'))
+
+if [[ ${#pod_names[@]} -eq 0 ]]; then
+    echo "No pods found in namespace: $namespace"
+    return 1
+fi
+
+# Create a new window for the first pod
+osascript <<EOF
+tell application "iTerm"
+  set newWindow to (create window with default profile)
+  tell newWindow
+    tell current session
+      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | zap-pretty"
+    end tell
+  end tell
+end tell
+EOF
+
+# Split the window into the number of pods
+for ((i = 1; i < ${#pod_names[@]}; i++)); do
+    osascript <<EOF
+tell application "iTerm"
+  tell current window
+    tell current session
+      split horizontally with default profile
+      delay 0.5
+    end tell
+  end tell
+end tell
+EOF
+done
+
+# Write the kubectl logs command to all of the panes
+for ((i = 0; i < ${#pod_names[@]}; i++)); do
+    osascript <<EOF
+tell application "iTerm"
+  tell current window
+    tell session $(($i + 1)) of current tab
+      write text "kubectl logs -n '$namespace' -f '${pod_names[$i]}' | zap-pretty"
+    end tell
+  end tell
+end tell
+EOF
+done
+
