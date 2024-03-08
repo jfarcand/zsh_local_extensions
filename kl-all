@@ -1,5 +1,13 @@
 #!/usr/bin/env zsh
 
+# Load environment variables from .envrc
+if [[ -f .envrc ]]; then
+    source .envrc
+else
+    echo ".envrc file not found"
+    return 1
+fi
+
 usage() {
     echo "Usage: [namespace]"
     echo "  - namespace: The Kubernetes namespace to search in (default: production)."
@@ -8,6 +16,10 @@ usage() {
 # Default values
 local namespace="${1:-production}" # Default to production if no namespace is provided
 local pod_names
+
+# Convert VERTICAL_PODS and HORIZONTAL_PODS to arrays
+vertical_pods=(${(s:,:)VERTICAL_PODS})
+horizontal_pods=(${(s:,:)HORIZONTAL_PODS})
 
 # Get all pod names in the namespace
 pod_names=($(kubectl get pod -n "$namespace" | awk 'NR>1 {print $1}'))
@@ -31,11 +43,24 @@ EOF
 
 # Split the window into the number of pods
 for ((i = 1; i < ${#pod_names[@]}; i++)); do
+    local split_direction="horizontally"
+    for vertical_pod in "${vertical_pods[@]}"; do
+        if [[ "${pod_names[$i]}" == *"$vertical_pod"* ]]; then
+            split_direction="vertically"
+            break
+        fi
+    done
+    for horizontal_pod in "${horizontal_pods[@]}"; do
+        if [[ "${pod_names[$i]}" == *"$horizontal_pod"* ]]; then
+            split_direction="horizontally"
+            break
+        fi
+    done
     osascript <<EOF
 tell application "iTerm"
   tell current window
     tell current session
-      split horizontally with default profile
+      split $split_direction with default profile
       delay 0.5
     end tell
   end tell
