@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# Usage function
+usage() {
+    echo "Usage: $0 <keyword> [-n <namespace>]"
+    echo "Delete Kubernetes jobs based on a keyword."
+    echo "  <keyword>          The keyword to search for in job names."
+    echo "  -n <namespace>      The namespace where the jobs are located (default: production)."
+    exit 1
+}
+
+# Check for required dependencies
+if ! command -v kubectl &> /dev/null; then
+    echo "Error: This script requires kubectl to be installed."
+    exit 1
+fi
+
+# Set default namespace
+namespace="production"
+
+# Parse command line arguments
+while getopts ":n:" opt; do
+    case ${opt} in
+        n ) namespace=$OPTARG ;;
+        \? ) usage ;;
+    esac
+done
+shift $((OPTIND -1))
+
+# Check if keyword was provided
+if [ $# -eq 0 ]; then
+    usage
+fi
+keyword=$1
+
+# Find jobs matching the keyword
+matching_jobs=$(kubectl get jobs -n "$namespace" -o jsonpath="{.items[?(@.metadata.name contains '$keyword')].metadata.name}")
+
+if [ -z "$matching_jobs" ]; then
+    echo "No jobs found matching the keyword '$keyword' in namespace '$namespace'."
+    exit 0
+fi
+
+echo "Found the following jobs matching the keyword '$keyword' in namespace '$namespace':"
+echo "$matching_jobs"
+
+# Confirm deletion
+read -p "Are you sure you want to delete these jobs? (y/N): " confirm
+if [[ ! "$confirm" =~ ^[yY](es)?$ ]]; then
+    echo "Deletion cancelled."
+    exit 0
+fi
+
+# Delete the matching jobs
+for job in $matching_jobs; do
+    kubectl delete job "$job" -n "$namespace"
+    echo "Deleted job: $job"
+done
+
