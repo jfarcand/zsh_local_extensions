@@ -1,22 +1,29 @@
 #!/usr/bin/env zsh
 
 usage() {
-    echo "Usage: $0 <key> [namespace]"
+    echo "Usage: $0 <key> [-n namespace]"
     echo "  - key: The key to search for in pod names."
-    echo "  - namespace: The Kubernetes namespace to search in (default: production)."
+    echo "  -n namespace: The Kubernetes namespace to search in (default: production)."
 }
 
+# Default values
+local namespace="production"
 local key="$1"
-local namespace="${2:-production}" # Default to production if no namespace is provided
-local pod_names
-local selected_pods=()
+
+# Check for namespace flag
+if [[ "$2" == "-n" ]] && [[ -n "$3" ]]; then
+    namespace="$3"
+elif [[ -n "$2" ]]; then
+    usage
+    return 1
+fi
 
 # Find the pod names based on the key
-pod_names=($(kubectl get pod -n "$namespace" | grep "$key" | awk '{print $1}'))
+local pod_names=($(kubectl get pod -n "$namespace" | grep "$key" | awk '{print $1}'))
 
 if [[ ${#pod_names[@]} -eq 0 ]]; then
-echo "No pods found with key: $key in namespace: $namespace"
-return 1
+    echo "No pods found with key: $key in namespace: $namespace"
+    return 1
 fi
 
 # Pass the count of pod_names to AppleScript
