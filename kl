@@ -33,7 +33,7 @@ osascript <<EOF
 tell application "iTerm"
   tell current window
     tell current session
-      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | zap-pretty"
+      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | jq"
       if $pod_count > 1 then
         split vertically with default profile
         delay 1
@@ -41,7 +41,7 @@ tell application "iTerm"
     end tell
     if $pod_count > 1 then
       tell last session of current tab
-        write text "kubectl logs -n '$namespace' -f '${pod_names[2]}' | zap-pretty"
+        write text "kubectl logs -n '$namespace' -f '${pod_names[2]}' | jq"
       end tell
     end if
   end tell
