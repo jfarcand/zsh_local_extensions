@@ -35,7 +35,7 @@ tell application "iTerm"
   set newWindow to (create window with default profile)
   tell newWindow
     tell current session
-      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | zap-pretty"
+      write text "kubectl logs -n '$namespace' -f '${pod_names[1]}' | jq"
     end tell
   end tell
 end tell
@@ -74,7 +74,7 @@ for ((i = 0; i < ${#pod_names[@]}; i++)); do
 tell application "iTerm"
   tell current window
     tell session $(($i + 1)) of current tab
-      write text "kubectl logs -n '$namespace' -f '${pod_names[$i]}' | zap-pretty"
+      write text "kubectl logs -n '$namespace' -f '${pod_names[$i]}' | jq"
     end tell
   end tell
 end tell
