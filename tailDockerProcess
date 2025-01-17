@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Get service name from command line argument, default to 'api' if not provided
+SERVICE=${1:-api}
+
+echo "Starting to follow logs for service: $SERVICE"
+
+while true; do
+    docker-compose logs -f "$SERVICE"
+    sleep 1
+done
