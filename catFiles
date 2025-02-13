@@ -2,23 +2,33 @@
 
 # Check if any arguments were provided
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 --excludes dir1,dir2,... --extensions ext1,ext2,... [paths...]"
+    echo "Usage: $0 [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] [--extra ext1,ext2] [paths...]"
     exit 1
 fi
 
 # Initialize variables
+ROOT=""
+INCLUDES=()
 EXCLUDE_DIRS=()
-PATHS=()
 EXTENSIONS=(".ts")  # Default to .ts files
+PATHS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --root)
+            ROOT="$2"
+            shift 2
+            ;;
+        --includes)
+            IFS=',' read -ra INCLUDES <<< "$2"
+            shift 2
+            ;;
         --excludes)
             IFS=',' read -ra EXCLUDE_DIRS <<< "$2"
             shift 2
             ;;
-        --extensions)
+        --extra)
             IFS=',' read -ra EXTENSIONS <<< "$2"
             shift 2
             ;;
@@ -87,12 +97,40 @@ process_folder() {
     done
 }
 
+# Function to process named files with includes
+process_named_files() {
+    local file_path="$1"
+    local name=$(basename "$file_path" .ts)
+    local dir="$ROOT"
+    
+    declare -a files
+    
+    # Add the original file
+    files+=("$file_path")
+    
+    # Add included types
+    for include in "${INCLUDES[@]}"; do
+        files+=("$dir/$include/$name.$include.ts")
+    done
+    
+    # Output concatenated files
+    for file in "${files[@]}"; do
+        if [ -f "$file" ]; then
+            echo "// $file"
+            cat "$file"
+            echo ""
+        fi
+    done
+}
+
 # Process each provided path
 for path in "${PATHS[@]}"; do
     if [ -f "$path" ]; then
         process_file "$path"
     elif [ -d "$path" ]; then
         process_folder "$path"
+    elif [ -n "$ROOT" ]; then
+        process_named_files "$ROOT/$path"
     fi
 done
 
