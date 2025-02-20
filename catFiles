@@ -2,7 +2,7 @@
 
 # Check if any arguments were provided
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] [--extra ext1,ext2] [paths...]"
+    echo "Usage: $0 [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] [--extra ext1,ext2] [--extensions ext1,ext2] [paths...]"
     exit 1
 fi
 
@@ -11,6 +11,7 @@ ROOT=""
 INCLUDES=()
 EXCLUDE_DIRS=()
 EXTENSIONS=(".ts")  # Default to .ts files
+EXTRA_EXTENSIONS=() # Extra file types (inputs, types, etc.)
 PATHS=()
 
 # Parse arguments
@@ -29,6 +30,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --extra)
+            IFS=',' read -ra EXTRA_EXTENSIONS <<< "$2"
+            shift 2
+            ;;
+        --extensions)
             IFS=',' read -ra EXTENSIONS <<< "$2"
             shift 2
             ;;
@@ -53,7 +58,7 @@ is_excluded() {
 # Function to check if file has a valid extension
 has_valid_extension() {
     local file="$1"
-    for ext in "${EXTENSIONS[@]}"; do
+    for ext in "${EXTENSIONS[@]}" "${EXTRA_EXTENSIONS[@]}"; do
         if [[ "$file" == *"$ext" ]]; then
             return 0
         fi
@@ -86,7 +91,7 @@ process_folder() {
 
     # Build extension pattern for `find`
     local find_extension_args=()
-    for ext in "${EXTENSIONS[@]}"; do
+    for ext in "${EXTENSIONS[@]}" "${EXTRA_EXTENSIONS[@]}"; do
         find_extension_args+=(-name "*$ext" -o)
     done
     unset 'find_extension_args[-1]'  # Remove last '-o'
@@ -101,18 +106,18 @@ process_folder() {
 process_named_files() {
     local file_path="$1"
     local name=$(basename "$file_path" .ts)
-    local dir="$ROOT"
-    
+    local dir=$(dirname "$file_path") # Dynamically detect the base directory
+
     declare -a files
-    
+
     # Add the original file
     files+=("$file_path")
-    
-    # Add included types
+
+    # Add included types (if any)
     for include in "${INCLUDES[@]}"; do
         files+=("$dir/$include/$name.$include.ts")
     done
-    
+
     # Output concatenated files
     for file in "${files[@]}"; do
         if [ -f "$file" ]; then
@@ -129,8 +134,8 @@ for path in "${PATHS[@]}"; do
         process_file "$path"
     elif [ -d "$path" ]; then
         process_folder "$path"
-    elif [ -n "$ROOT" ]; then
-        process_named_files "$ROOT/$path"
+    else
+        process_named_files "$path"
     fi
 done
 
