@@ -66,6 +66,24 @@ has_valid_extension() {
     return 1
 }
 
+# Function to find and include related files for --extra inputs,types
+find_related_files() {
+    local base_file="$1"
+    local dir=$(dirname "$base_file")
+    local name=$(basename "$base_file" .resolver.ts)
+
+    for extra in "${EXTRA_EXTENSIONS[@]}"; do
+        if [[ "$extra" == "inputs" ]]; then
+            input_file="$dir/input/${name}.inputs.ts"
+            [[ -f "$input_file" ]] && PATHS+=("$input_file")
+        fi
+        if [[ "$extra" == "types" ]]; then
+            type_file="$dir/types/${name}.types.ts"
+            [[ -f "$type_file" ]] && PATHS+=("$type_file")
+        fi
+    done
+}
+
 # Function to process a single file
 process_file() {
     local file="$1"
@@ -102,31 +120,17 @@ process_folder() {
     done
 }
 
-# Function to process named files with includes
-process_named_files() {
-    local file_path="$1"
-    local name=$(basename "$file_path" .ts)
-    local dir=$(dirname "$file_path") # Dynamically detect the base directory
+# Expand file list based on --extra inputs,types
+for file in "${PATHS[@]}"; do
+    find_related_files "$file"
+done
 
-    declare -a files
-
-    # Add the original file
-    files+=("$file_path")
-
-    # Add included types (if any)
-    for include in "${INCLUDES[@]}"; do
-        files+=("$dir/$include/$name.$include.ts")
+# If a root directory is specified, prepend it to file paths
+if [ -n "$ROOT" ]; then
+    for i in "${!PATHS[@]}"; do
+        PATHS[$i]="$ROOT/${PATHS[$i]}"
     done
-
-    # Output concatenated files
-    for file in "${files[@]}"; do
-        if [ -f "$file" ]; then
-            echo "// $file"
-            cat "$file"
-            echo ""
-        fi
-    done
-}
+fi
 
 # Process each provided path
 for path in "${PATHS[@]}"; do
@@ -134,8 +138,5 @@ for path in "${PATHS[@]}"; do
         process_file "$path"
     elif [ -d "$path" ]; then
         process_folder "$path"
-    else
-        process_named_files "$path"
     fi
 done
-
