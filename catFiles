@@ -10,7 +10,7 @@ fi
 ROOT=""
 INCLUDES=()
 EXCLUDE_DIRS=()
-EXTENSIONS=(".ts")  # Default to .ts files
+EXTENSIONS=(".ts" ".tsx")  # Default to .ts files
 EXTRA_EXTENSIONS=() # Extra file types (inputs, types, etc.)
 PATHS=()
 
@@ -69,20 +69,17 @@ has_valid_extension() {
 # Function to find and include related files for --extra inputs,types
 find_related_files() {
     local base_file="$1"
-    local dir=$(dirname "$base_file")
-    local name=$(basename "$base_file" .resolver.ts)
+    local base_name=$(basename "$base_file" .resolver.ts)
 
-    for extra in "${EXTRA_EXTENSIONS[@]}"; do
-        if [[ "$extra" == "inputs" ]]; then
-            input_file="$dir/input/${name}.inputs.ts"
-            [[ -f "$input_file" ]] && PATHS+=("$input_file")
-        fi
-        if [[ "$extra" == "types" ]]; then
-            type_file="$dir/types/${name}.types.ts"
-            [[ -f "$type_file" ]] && PATHS+=("$type_file")
+    for extra_path in "${EXTRA_EXTENSIONS[@]}"; do
+        if [[ -d "$extra_path" ]]; then
+            while IFS= read -r related_file; do
+                [[ -f "$related_file" ]] && PATHS+=("$related_file")
+            done < <(find "$extra_path" -type f \( -name "${base_name}.inputs.ts" -o -name "${base_name}.types.ts" \))
         fi
     done
 }
+
 
 # Function to process a single file
 process_file() {
