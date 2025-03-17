@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+# -----------------------------------------------------------------------------
+# catAllFiles: Concatenate related files from multiple directories
+# -----------------------------------------------------------------------------
+# Usage:
+#   catAllFiles <dir1> <dir2>
+#
+# Description:
+#   This script scans all files in the first directory, extracts the base name
+#   (before the first dot `.`), then searches for matching files in both 
+#   directories using `catFiles --grep`. The output is saved in `~/Downloads/`.
+#
+# Example:
+#   catAllFiles seeds/ mutations/
+#   - If `seeds/forest.seed.ts` exists, it will run:
+#     catFiles --grep forest seeds/ mutations/ > ~/Downloads/forest-code.ts
+# -----------------------------------------------------------------------------
+
+# Ensure two directories are provided
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <dir1> <dir2>"
+    exit 1
+fi
+
+# Set directories
+DIR1="$1"
+DIR2="$2"
+
+# Output directory
+OUTPUT_DIR=~/Downloads
+
+# Ensure the output directory exists
+mkdir -p "$OUTPUT_DIR"
+
+# Iterate over files in the first directory
+for file in "$DIR1"/*; do
+    # Ensure it's a file
+    if [[ -f "$file" ]]; then
+        # Extract the base name before the first dot (e.g., "forest" from "forest.seed.ts")
+        baseName=$(basename "$file" | cut -d '.' -f1)
+
+        # Define output file path
+        outputFile="$OUTPUT_DIR/${baseName}-code.ts"
+
+        # Debug: Show the command being run
+        echo "Running: catFiles --grep \"$baseName\" \"$DIR1\" \"$DIR2\" > \"$outputFile\""
+
+        # Run catFiles and save output
+        catFiles --grep "$baseName" "$DIR1" "$DIR2" > "$outputFile"
+
+        # Check if the output file is successfully created
+        if [[ -s "$outputFile" ]]; then
+            echo "✅ Processed $baseName -> $outputFile"
+        else
+            echo "❌ Failed to process $baseName or empty output: $outputFile"
+        fi
+    fi
+done
+
+echo "Processing complete. Files saved in $OUTPUT_DIR."
