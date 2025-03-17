@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+# Check if a directory argument is provided
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <directory>"
+    exit 1
+fi
+
+# Set the target directory
+TARGET_DIR="$1"
+
+# Define extra paths
+EXTRA_PATHS="./../../../libs/shared-types/src/lib/inputs/,../../../../libs/shared-types/src/lib/types"
+
+# Output directory
+OUTPUT_DIR=~/Downloads
+
+# Ensure the output directory exists
+mkdir -p "$OUTPUT_DIR"
+
+# Iterate over files in the given directory
+for file in "$TARGET_DIR"/*; do
+    # Ensure it's a file
+    if [[ -f "$file" ]]; then
+        # Extract the filename without the path and remove .ts extension
+        fileName=$(basename "$file" .ts)
+
+        # Define the output file path
+        outputFile="$OUTPUT_DIR/${fileName}-code.ts"
+
+        # Debug: Show what will be executed
+        echo "Running: catFiles \"$file\" --extra \"$EXTRA_PATHS\" > \"$outputFile\""
+
+        # Run catFiles and save output
+        catFiles "$file" --extra "$EXTRA_PATHS" > "$outputFile"
+
+        # Check if the file was correctly created and populated
+        if [[ -s "$outputFile" ]]; then
+            echo "✅ Processed $file -> $outputFile"
+        else
+            echo "❌ Failed to process $file or empty output: $outputFile"
+        fi
+    fi
+done
+
+echo "Processing complete. Files saved in $OUTPUT_DIR."

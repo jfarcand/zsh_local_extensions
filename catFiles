@@ -47,6 +47,10 @@ PATHS=()
 GREP_PATTERN=""  # Store grep pattern
 SCHEMA_FILE=""  # Store schema file path
 
+# Create a temporary file to track processed models
+MODEL_TRACKER=$(mktemp)
+trap 'rm -f "$MODEL_TRACKER"' EXIT  # Remove temp file on exit
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,16 +89,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Function to check if a model has already been processed
+is_model_processed() {
+    local modelName="$1"
+    grep -q "^${modelName}$" "$MODEL_TRACKER"
+    return $?
+}
+
+# Function to mark a model as processed
+mark_model_processed() {
+    local modelName="$1"
+    echo "$modelName" >> "$MODEL_TRACKER"
+}
+
 # Function to find model definition in schema.prisma
 find_model_in_schema() {
     local modelName="$1"
     local schema="$2"
 
+    # Check if this model has already been processed
+    if is_model_processed "$modelName"; then
+        return  # Skip if already processed
+    fi
+
     if [[ -f "$schema" ]]; then
-        awk -v model="model $modelName {" '
+        local modelDefinition=$(awk -v model="model $modelName {" '
         $0 ~ model { capture=1 } capture;
         capture && /^}/ { capture=0; print ""; exit }
-        ' "$schema"
+        ' "$schema")
+        
+        if [[ -n "$modelDefinition" ]]; then
+            # Only mark as processed if we actually found the model
+            mark_model_processed "$modelName"
+            echo "$modelDefinition"
+        fi
     fi
 }
 
@@ -153,13 +181,24 @@ process_file() {
     fi
 }
 
-# Process each provided path
+# Print initial message
+echo "// Processing files with model tracking to prevent duplicate model definitions"
+echo ""
+
+# Process all files
 for path in "${PATHS[@]}"; do
     if [ -f "$path" ]; then
         process_file "$path"
     elif [ -d "$path" ]; then
-        find "$path" -type f -print | while IFS= read -r file; do
+        # Use while loop with process substitution to avoid subshell issues
+        while IFS= read -r file; do
             process_file "$file"
-        done
+        done < <(find "$path" -type f -print)
     fi
 done
+
+# Print summary of processed models
+MODEL_COUNT=$(wc -l < "$MODEL_TRACKER")
+if [ "$MODEL_COUNT" -gt 0 ]; then
+    echo "// Processed $MODEL_COUNT unique models: $(cat "$MODEL_TRACKER" | tr '\n' ' ')"
+fi
