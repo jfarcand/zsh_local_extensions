@@ -1,101 +1,46 @@
 #!/usr/bin/env bash
 
 # -----------------------------------------------------------------------------
-# catAllFiles: Concatenate related files with optional schema lookup
+# catAllFiles: Calls catFiles on all base names found in directories.
 # -----------------------------------------------------------------------------
 # Usage:
-#   catAllFiles [--withSchema schema.prisma] <dir1> <dir2>
-#
-# Description:
-#   This script scans files in the first directory, extracts the base name
-#   (before the first dot `.`), then searches for matching files in both 
-#   directories using `catFiles --grep`. If --withSchema is provided, it 
-#   looks for a corresponding model definition in the schema file and 
-#   includes it at the beginning of the output.
+#   catAllFiles [--withSchema schema.prisma] <dir1> <dir2> <dir3> ...
 #
 # Example:
-#   catAllFiles --withSchema prisma.schema seeds/ mutations/
-#   - If `seeds/forest.seed.ts` exists, it will:
-#     1. Find `model Forest { ... }` in `prisma.schema`
-#     2. Include that in the output
-#     3. Concatenate related files
+#   catAllFiles --withSchema prisma/schema.prisma prisma/seeds prisma/mutations src/resolvers/
 # -----------------------------------------------------------------------------
 
-# Ensure at least two directories are provided
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 [--withSchema schema.prisma] <dir1> <dir2>"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 [--withSchema schema.prisma] <dir1> <dir2> ..."
     exit 1
 fi
 
-# Initialize variables
 SCHEMA_FILE=""
-DIR1=""
-DIR2=""
+DIRECTORIES=()
 
-# Parse arguments
 if [[ "$1" == "--withSchema" ]]; then
     SCHEMA_FILE="$2"
     shift 2
 fi
 
-DIR1="$1"
-DIR2="$2"
-
-# Output directory
+DIRECTORIES=("$@")
 OUTPUT_DIR=~/Downloads
-
-# Ensure the output directory exists
 mkdir -p "$OUTPUT_DIR"
 
-# Function to find model definition in schema.prisma
-find_model_in_schema() {
-    local modelName="$1"
-    local schema="$2"
-
-    if [[ -f "$schema" ]]; then
-        # Extract the model block by searching for "model ModelName {"
-        awk -v model="model $modelName {" '
-        $0 ~ model { capture=1 } capture; 
-        capture && /^}/ { capture=0; print ""; exit }
-        ' "$schema"
-    fi
-}
-
-# Iterate over files in the first directory
-for file in "$DIR1"/*; do
-    # Ensure it's a file
+for file in "${DIRECTORIES[0]}"/*; do
     if [[ -f "$file" ]]; then
-        # Extract the base name before the first dot (e.g., "forest" from "forest.seed.ts")
         baseName=$(basename "$file" | cut -d '.' -f1)
-
-        # Capitalize the first letter of the base name for schema lookup
-        capitalizedBaseName="$(tr '[:lower:]' '[:upper:]' <<< "${baseName:0:1}")${baseName:1}"
-
-        # Define output file path
         outputFile="$OUTPUT_DIR/${baseName}-code.ts"
 
-        # Debug: Show the command being run
         echo "Processing: $baseName"
-
-        # If --withSchema is provided, add model definition to the output file
         if [[ -n "$SCHEMA_FILE" ]]; then
-            modelDefinition=$(find_model_in_schema "$capitalizedBaseName" "$SCHEMA_FILE")
-
-            if [[ -n "$modelDefinition" ]]; then
-                echo "$modelDefinition" > "$outputFile"
-            fi
-        fi
-
-        # Append the concatenated file content
-        catFiles --grep "$baseName" "$DIR1" "$DIR2" >> "$outputFile"
-
-        # Check if the output file is successfully created
-        if [[ -s "$outputFile" ]]; then
-            echo "✅ Processed $baseName -> $outputFile"
+            catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}" > "$outputFile"
         else
-            echo "❌ Failed to process $baseName or empty output: $outputFile"
+            catFiles --grep "$baseName" "${DIRECTORIES[@]}" > "$outputFile"
         fi
+
+        [[ -s "$outputFile" ]] && echo "✅ Processed $baseName -> $outputFile" || echo "❌ Failed: $outputFile"
     fi
 done
 
-echo "Processing complete. Files saved in $OUTPUT_DIR."
+echo "Processing complete."
