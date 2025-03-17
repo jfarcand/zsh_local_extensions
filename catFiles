@@ -1,8 +1,52 @@
 #!/usr/bin/env bash
 
+# -----------------------------------------------------------------------------
+# catFiles: A Bash script to concatenate and display files for LLM processing 
+# (lightweight repomix). It supports filtering by file extensions,
+# excluding directories, and searching for filenames containing a specific 
+# string (via --grep). It also allows including related files based on 
+# predefined patterns (e.g., inputs, types).
+# -----------------------------------------------------------------------------
+# Usage:
+#   catFiles [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] 
+#            [--extra ext1,ext2] [--extensions ext1,ext2] [--grep pattern] 
+#            [paths...]
+#
+# Description:
+#   This script processes files, concatenating and displaying their contents 
+#   based on specified criteria. It supports filtering by file extensions, 
+#   excluding directories, and searching for filenames containing a specific 
+#   string (via --grep). It also allows including related files based on 
+#   predefined patterns (e.g., inputs, types).
+#
+# Options:
+#   --root path         Set a root directory to prepend to file paths.
+#   --includes ext1,ext2
+#                       Include only specific file extensions (comma-separated).
+#   --excludes dir1,dir2
+#                       Exclude specific directories from processing.
+#   --extra ext1,ext2   Include additional related files using the filename (e.g., inputs, types).
+#   --extensions ext1,ext2
+#                       Set allowed file extensions (default: .ts, .tsx).
+#   --grep pattern      Filter filenames containing a specific pattern.
+#   paths...            Files or directories to process.
+#
+# Examples:
+#   1. Process all files in "resolvers/" containing "forest":
+#      catFiles --grep forest resolvers/
+#
+#   2. Concatenate all TypeScript files in "src/" but exclude "node_modules":
+#      catFiles --excludes node_modules src/
+#
+#   3. Include related "inputs" and "types" files from a shared folder:
+#      catFiles --extra ../../libs/shared-types/src/lib/inputs,
+#                         ../../libs/shared-types/src/lib/types resolvers/
+#
+# -----------------------------------------------------------------------------
+
 # Check if any arguments were provided
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] [--extra ext1,ext2] [--extensions ext1,ext2] [paths...]"
+    echo "Usage: $0 [--root path] [--includes ext1,ext2] [--excludes dir1,dir2] [--extra ext1,ext2] [--extensions ext1,ext2] [--grep pattern] [paths...]"
     exit 1
 fi
 
@@ -10,9 +54,10 @@ fi
 ROOT=""
 INCLUDES=()
 EXCLUDE_DIRS=()
-EXTENSIONS=(".ts" ".tsx")  # Default to .ts files
+EXTENSIONS=(".ts" ".tsx")  # Default to .ts and .tsx files, but customizable
 EXTRA_EXTENSIONS=() # Extra file types (inputs, types, etc.)
 PATHS=()
+GREP_PATTERN=""  # Store grep pattern
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -37,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             IFS=',' read -ra EXTENSIONS <<< "$2"
             shift 2
             ;;
+        --grep)
+            GREP_PATTERN="$2"
+            shift 2
+            ;;
         *)
             PATHS+=("$1")
             shift
@@ -44,7 +93,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to check if path should be excluded
+# Function to check if a file should be excluded
 is_excluded() {
     local file="$1"
     for exclude in "${EXCLUDE_DIRS[@]}"; do
@@ -55,7 +104,7 @@ is_excluded() {
     return 1
 }
 
-# Function to check if file has a valid extension
+# Function to check if a file has a valid extension
 has_valid_extension() {
     local file="$1"
     for ext in "${EXTENSIONS[@]}" "${EXTRA_EXTENSIONS[@]}"; do
@@ -66,7 +115,18 @@ has_valid_extension() {
     return 1
 }
 
-# Function to find and include related files for --extra inputs,types
+# Function to filter files by grep pattern
+matches_grep_pattern() {
+    local file="$1"
+    if [[ -n "$GREP_PATTERN" ]]; then
+        if [[ "$file" != *"$GREP_PATTERN"* ]]; then
+            return 1  # File doesn't match grep pattern
+        fi
+    fi
+    return 0  # No grep pattern or file matches
+}
+
+# Function to find and include related files for --extra inputs, types
 find_related_files() {
     local base_file="$1"
     local base_name=$(basename "$base_file" .resolver.ts)
@@ -80,11 +140,10 @@ find_related_files() {
     done
 }
 
-
 # Function to process a single file
 process_file() {
     local file="$1"
-    if [ -f "$file" ] && ! is_excluded "$file" && has_valid_extension "$file"; then
+    if [ -f "$file" ] && ! is_excluded "$file" && has_valid_extension "$file" && matches_grep_pattern "$file"; then
         echo "// $file"
         cat "$file"
         echo ""
@@ -117,7 +176,7 @@ process_folder() {
     done
 }
 
-# Expand file list based on --extra inputs,types
+# Expand file list based on --extra inputs, types
 for file in "${PATHS[@]}"; do
     find_related_files "$file"
 done
