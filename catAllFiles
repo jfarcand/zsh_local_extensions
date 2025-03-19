@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 
 # -----------------------------------------------------------------------------
-# catAllFilesWatch: A simplified file watcher for macOS that processes files on change
+# catAllFiles: Calls catFiles on all base names found in directories.
 # -----------------------------------------------------------------------------
 # Usage:
-#   catAllFilesWatch [--withSchema schema.prisma] [--outDir <dir>] [--force] <scan_dir> <dir1> <dir2> <dir3> ...
+#   catAllFiles [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> <dir3> ...
 #
 # Options:
 #   --withSchema schema.prisma    Schema file to use for model lookups
+#   --scanDir <dir>               Directory to scan for base names (defaults to first directory)
 #   --outDir <dir>                Where to save output files (defaults to ~/Downloads)
-#   --force                       Process all files on any change instead of only changed files
+#   --watch                       Watch directories for changes and reprocess files
 #
 # Example:
-#   catAllFilesWatch --withSchema prisma/schema.prisma prisma/seeds prisma/mutations src/resolvers/
+#   catAllFiles --withSchema prisma/schema.prisma --watch prisma/seeds prisma/mutations src/resolvers/
 # -----------------------------------------------------------------------------
 
 # Process arguments
 SCHEMA_FILE=""
-OUTPUT_DIR=~/Downloads
 SCAN_DIR=""
-FORCE_MODE=false
+OUTPUT_DIR=~/Downloads
+WATCH_MODE=false
 DIRECTORIES=()
 
 while [[ $# -gt 0 ]]; do
@@ -32,239 +33,314 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        --scanDir)
+            SCAN_DIR="$2"
+            if [ ! -d "$SCAN_DIR" ]; then
+                echo "Error: Scan directory '$SCAN_DIR' not found"
+                exit 1
+            fi
+            shift 2
+            ;;
         --outDir)
             OUTPUT_DIR="$2"
             shift 2
             ;;
-        --force)
-            FORCE_MODE=true
+        --watch)
+            WATCH_MODE=true
             shift
             ;;
         *)
-            if [[ -z "$SCAN_DIR" ]]; then
-                SCAN_DIR="$1"
-            else
-                DIRECTORIES+=("$1")
-            fi
+            DIRECTORIES+=("$1")
             shift
             ;;
     esac
 done
 
 # Validate arguments
-if [[ -z "$SCAN_DIR" ]]; then
-    echo "Error: No scan directory specified"
-    echo "Usage: $0 [--withSchema schema.prisma] [--outDir <dir>] <scan_dir> <dir1> <dir2> ..."
+if [ ${#DIRECTORIES[@]} -eq 0 ]; then
+    echo "Error: No directories specified"
+    echo "Usage: $0 [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> ..."
     exit 1
 fi
 
-# Add scan dir to directories if not already included
-DIRECTORIES+=("$SCAN_DIR")
-
-# Remove duplicates from directories
-DIRECTORIES=($(printf "%s\n" "${DIRECTORIES[@]}" | sort -u))
-
-# Display watch mode
-if [ "$FORCE_MODE" = true ]; then
-    echo "🔄 Force mode enabled: Will process ALL files on any change"
-else
-    echo "🔍 Smart mode enabled: Will only process changed files"
+# If no scan directory specified, use the first directory
+if [ -z "$SCAN_DIR" ]; then
+    SCAN_DIR="${DIRECTORIES[0]}"
 fi
 
-# Check if directories exist
-for dir in "${DIRECTORIES[@]}"; do
-    if [ ! -d "$dir" ]; then
-        echo "Warning: Directory '$dir' does not exist"
-    else
-        echo "Watching directory: $dir"
-    fi
-done
+# Check if scan directory exists
+if [ ! -d "$SCAN_DIR" ]; then
+    echo "Error: Scan directory '$SCAN_DIR' not found or not accessible"
+    exit 1
+fi
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 echo "Output files will be saved to: $OUTPUT_DIR"
 
-# Get list of base names from scan directory
-BASENAMES=()
-for file in "$SCAN_DIR"/*; do
-    if [[ -f "$file" ]]; then
-        baseName=$(basename "$file" | cut -d '.' -f1)
-        BASENAMES+=("$baseName")
-    fi
-done
+# Function to get base name from a file path
+get_base_name() {
+    local file_path="$1"
+    local file_name=$(basename "$file_path")
+    echo "${file_name%.*}"  # Remove extension
+}
 
-echo "Found ${#BASENAMES[@]} base names to process in $SCAN_DIR"
-
-# Process all base names
+# Process all files (used for initial run and full reprocessing)
 process_all_files() {
-    echo "Processing all base names..."
-    local successful=0
-    local failed=0
-    local total=${#BASENAMES[@]}
-    
-    for ((i=0; i<total; i++)); do
-        local baseName="${BASENAMES[$i]}"
-        echo "[$(($i+1))/$total] Processing: $baseName"
-        
-        if process_file "$baseName"; then
-            ((successful++))
-        else
-            ((failed++))
+    # Count and track files for summary
+    SUCCESSFUL=0
+    FAILED=0
+    PROCESSED=0
+
+    # Get list of files to process
+    BASENAMES=()
+    for file in "$SCAN_DIR"/*; do
+        if [[ -f "$file" ]]; then
+            baseName=$(basename "$file" | cut -d '.' -f1)
+            BASENAMES+=("$baseName")
         fi
     done
-    
+
+    echo "Found ${#BASENAMES[@]} base names to process in $SCAN_DIR"
+
+    # Process each base name
+    for baseName in "${BASENAMES[@]}"; do
+        ((PROCESSED++))
+        outputFile="$OUTPUT_DIR/${baseName}-code.ts"
+        
+        echo "[$PROCESSED/${#BASENAMES[@]}] Processing: $baseName"
+        
+        # Add header with metadata
+        {
+            echo "// Generated by catAllFiles on $(date)"
+            echo "// Base name: $baseName"
+            echo "// Directories scanned: ${DIRECTORIES[*]}"
+            echo "// Schema file: ${SCHEMA_FILE:-None}"
+            echo ""
+            
+            # Run catFiles and capture output
+            if [[ -n "$SCHEMA_FILE" ]]; then
+                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+            else
+                catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+            fi
+        } > "$outputFile"
+        
+        # Check if file contains actual content beyond the header (5 lines)
+        if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
+            echo "✅ Processed $baseName -> $outputFile"
+            ((SUCCESSFUL++))
+        else
+            echo "❌ No matching content found for $baseName"
+            rm "$outputFile"  # Remove empty files
+            ((FAILED++))
+        fi
+    done
+
     echo ""
     echo "Processing complete:"
-    echo "- Total processed: $total"
-    echo "- Successful: $successful"
-    echo "- No content found: $failed"
+    echo "- Total processed: $PROCESSED"
+    echo "- Successful: $SUCCESSFUL"
+    echo "- No content found: $FAILED"
     echo "- Output location: $OUTPUT_DIR"
 }
 
-# Process a specific base name
-process_file() {
-    local baseName="$1"
-    local outputFile="$OUTPUT_DIR/${baseName}-code.ts"
-    
-    echo "Processing: $baseName"
-    
-    # Add header with metadata
-    {
-        echo "// Generated by catAllFilesWatch on $(date)"
-        echo "// Base name: $baseName"
-        echo "// Directories scanned: ${DIRECTORIES[*]}"
-        echo "// Schema file: ${SCHEMA_FILE:-None}"
-        echo ""
-        
-        # Run catFiles and capture output
-        if [[ -n "$SCHEMA_FILE" ]]; then
-            catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
-        else
-            catFiles --grep "$baseName" "${DIRECTORIES[@]}"
-        fi
-    } > "$outputFile"
-    
-    # Check if file contains actual content beyond the header (5 lines)
-    if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
-        echo "✅ Processed $baseName -> $outputFile"
-        return 0
-    else
-        echo "❌ No matching content found for $baseName"
-        rm "$outputFile"  # Remove empty files
-        return 1
-    fi
-}
-
-# Find base name from file path
-get_base_from_path() {
+# Function to detect which base name a file corresponds to
+get_base_name_for_file() {
     local file="$1"
     local file_basename=$(basename "$file")
     
-    # Try to match with known base names
-    for base in "${BASENAMES[@]}"; do
-        if [[ "$file_basename" == *"$base"* ]]; then
+    # First check if this is a file from scan directory - direct match
+    if [[ "$file" == "$SCAN_DIR"/* ]]; then
+        echo "${file_basename%.*}" | cut -d '.' -f1
+        return 0
+    fi
+    
+    # Try exact matches on base names we know
+    for base in "${ALL_BASENAMES[@]}"; do
+        if [[ "$file_basename" == "$base".* || "$file_basename" == *"$base"* ]]; then
             echo "$base"
             return 0
         fi
     done
     
-    # If no match, return the base filename without extension
-    echo "${file_basename%.*}"
+    # No match found
     return 1
 }
 
-# Track file modification times
-declare -A FILE_TIMES
+# Run initial processing
+process_all_files
 
-# Initial scan to build baseline
-echo "Building initial file index..."
-total_files=0
-for dir in "${DIRECTORIES[@]}"; do
-    if [[ -d "$dir" ]]; then
-        while read -r file; do
-            if [[ -f "$file" ]]; then
-                # Get modification time
-                mod_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
-                FILE_TIMES["$file"]=$mod_time
-                ((total_files++))
-            fi
-        done < <(find "$dir" -type f -not -path "*/\.*" -not -path "*/node_modules/*" 2>/dev/null || echo "")
-    fi
-done
-
-echo "Watching $total_files files for changes..."
-echo "Press Ctrl+C to stop watching."
-
-# Set last run time
-LAST_RUN=$(date +%s)
-MIN_INTERVAL=2  # Minimum seconds between runs
-
-# Polling loop
-while true; do
-    sleep 1
-    changed=false
-    changed_files=()
+# If watch mode is enabled, continue watching for changes
+if [ "$WATCH_MODE" = true ]; then
+    echo ""
+    echo "🔍 Watch mode enabled. Monitoring directories for changes..."
+    echo "Press Ctrl+C to stop watching."
     
-    for dir in "${DIRECTORIES[@]}"; do
+    # Build directory list to watch
+    WATCH_DIRS=("${DIRECTORIES[@]}")
+    if [[ -n "$SCHEMA_FILE" ]]; then
+        SCHEMA_DIR=$(dirname "$SCHEMA_FILE")
+        WATCH_DIRS+=("$SCHEMA_DIR")
+    fi
+    
+    # Remove duplicates
+    WATCH_DIRS=($(printf "%s\n" "${WATCH_DIRS[@]}" | sort -u))
+    
+    # Get all base names for reference
+    ALL_BASENAMES=()
+    for file in "$SCAN_DIR"/*; do
+        if [[ -f "$file" ]]; then
+            baseName=$(basename "$file" | cut -d '.' -f1)
+            ALL_BASENAMES+=("$baseName")
+        fi
+    done
+    
+    echo "Found ${#ALL_BASENAMES[@]} base names for watch mode"
+    
+    # Print directories being watched
+    echo "Watching directories:"
+    for dir in "${WATCH_DIRS[@]}"; do
+        echo "- $dir"
+    done
+    
+    # Set last run time
+    LAST_RUN=$(date +%s)
+    MIN_INTERVAL=2  # Minimum seconds between runs
+    
+    # Store file modification times
+    declare -A FILE_TIMES
+    
+    # Initial scan to build baseline
+    echo "Building initial file index..."
+    total_files=0
+    for dir in "${WATCH_DIRS[@]}"; do
         if [[ -d "$dir" ]]; then
             while read -r file; do
                 if [[ -f "$file" ]]; then
-                    # Get current modification time
-                    current_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
-                    
-                    # If file is new or modified
-                    if [[ -z "${FILE_TIMES[$file]}" || "${FILE_TIMES[$file]}" != "$current_time" ]]; then
-                        changed=true
-                        changed_files+=("$file")
-                        FILE_TIMES["$file"]=$current_time
-                    fi
+                    # Get modification time
+                    mod_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
+                    FILE_TIMES["$file"]=$mod_time
+                    ((total_files++))
                 fi
             done < <(find "$dir" -type f -not -path "*/\.*" -not -path "*/node_modules/*" 2>/dev/null || echo "")
         fi
     done
     
-    # Process changed files
-    if [[ "$changed" == true ]]; then
-        CURRENT_TIME=$(date +%s)
-        if (( CURRENT_TIME - LAST_RUN >= MIN_INTERVAL )); then
+    echo "Watching $total_files files for changes (polling every 1 second)..."
+    
+    # Process a single base name when change detected
+    process_base_name() {
+        local baseName="$1"
+        local outputFile="$OUTPUT_DIR/${baseName}-code.ts"
+        
+        echo "Processing: $baseName"
+        
+        # Add header with metadata
+        {
+            echo "// Generated by catAllFiles on $(date)"
+            echo "// Base name: $baseName"
+            echo "// Directories scanned: ${DIRECTORIES[*]}"
+            echo "// Schema file: ${SCHEMA_FILE:-None}"
             echo ""
-            echo "🔄 Changes detected at $(date '+%H:%M:%S')!"
             
-            # Show first 3 changed files (max)
-            for ((i=0; i<3 && i<${#changed_files[@]}; i++)); do
-                echo "- ${changed_files[$i]}"
-            done
-            
-            if [[ ${#changed_files[@]} -gt 3 ]]; then
-                echo "- ...and $((${#changed_files[@]} - 3)) more files"
-            fi
-            
-            # Process changes based on mode
-            if [ "$FORCE_MODE" = true ]; then
-                # Force mode: process all files
-                echo "Force mode: processing all files..."
-                process_all_files
+            # Run catFiles and capture output with the EXACT SAME command
+            if [[ -n "$SCHEMA_FILE" ]]; then
+                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
             else
-                # Smart mode: process only changed files
-                echo "Smart mode: processing changed files..."
+                catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+            fi
+        } > "$outputFile"
+        
+        # Check if file contains actual content beyond the header (5 lines)
+        if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
+            echo "✅ Processed $baseName -> $outputFile"
+            return 0
+        else
+            echo "❌ No matching content found for $baseName"
+            rm "$outputFile"  # Remove empty files
+            return 1
+        fi
+    }
+    
+    # Polling loop
+    while true; do
+        sleep 1
+        changed=false
+        changed_files=()
+        
+        for dir in "${WATCH_DIRS[@]}"; do
+            if [[ -d "$dir" ]]; then
+                while read -r file; do
+                    if [[ -f "$file" ]]; then
+                        # Get current modification time
+                        current_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
+                        
+                        # If file is new or modified
+                        if [[ -z "${FILE_TIMES[$file]}" || "${FILE_TIMES[$file]}" != "$current_time" ]]; then
+                            changed=true
+                            changed_files+=("$file")
+                            FILE_TIMES["$file"]=$current_time
+                        fi
+                    fi
+                done < <(find "$dir" -type f -not -path "*/\.*" -not -path "*/node_modules/*" 2>/dev/null || echo "")
+            fi
+        done
+        
+        # Process changed files
+        if [[ "$changed" == true ]]; then
+            CURRENT_TIME=$(date +%s)
+            if (( CURRENT_TIME - LAST_RUN >= MIN_INTERVAL )); then
+                echo ""
+                echo "🔄 Changes detected at $(date '+%H:%M:%S')!"
+                
+                # Show changed files (limit to first 3 for brevity)
+                max_display=$(( ${#changed_files[@]} > 3 ? 3 : ${#changed_files[@]} ))
+                for ((i=0; i<max_display; i++)); do
+                    echo "- ${changed_files[$i]}"
+                done
+                
+                if [[ ${#changed_files[@]} -gt 3 ]]; then
+                    echo "- ...and $((${#changed_files[@]} - 3)) more files"
+                fi
+                
+                # Track which base names have been processed
+                processed_bases=()
+                processed_count=0
+                
                 # Process each changed file
-                processed=false
                 for file in "${changed_files[@]}"; do
-                    base=$(get_base_from_path "$file")
-                    if [[ -n "$base" ]]; then
-                        process_file "$base"
-                        processed=true
+                    base_name=$(get_base_name_for_file "$file")
+                    
+                    # Skip if we can't determine the base name
+                    if [[ -z "$base_name" ]]; then
+                        continue
+                    fi
+                    
+                    # Skip if we've already processed this base name
+                    if [[ " ${processed_bases[*]} " == *" $base_name "* ]]; then
+                        continue
+                    fi
+                    
+                    # Process the file
+                    echo "🔍 File change relates to base name: $base_name"
+                    if process_base_name "$base_name"; then
+                        processed_bases+=("$base_name")
+                        ((processed_count++))
                     fi
                 done
                 
-                # If no files were processed, inform the user
-                if [ "$processed" = false ]; then
-                    echo "ℹ️ No relevant files were found to process."
+                # If no files were processed, notify the user
+                if [[ $processed_count -eq 0 ]]; then
+                    echo "⚠️ No relevant files to process. Change might not be related to any known base names."
+                else
+                    echo "✅ Processed $processed_count base name(s)"
                 fi
+                
+                LAST_RUN=$(date +%s)
+                echo ""
+                echo "Watching for more changes... (Press Ctrl+C to stop)"
             fi
-            
-            LAST_RUN=$(date +%s)
-            echo "Watching for more changes... (Press Ctrl+C to stop)"
         fi
-    fi
-done
+    done
+fi
