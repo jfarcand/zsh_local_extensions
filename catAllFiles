@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 
 # -----------------------------------------------------------------------------
-# catAllFiles: Calls catFiles on all base names found in directories.
+# catAllFilesWatch: A simplified file watcher for macOS that processes files on change
 # -----------------------------------------------------------------------------
 # Usage:
-#   catAllFiles [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> <dir3> ...
+#   catAllFilesWatch [--withSchema schema.prisma] [--outDir <dir>] [--force] <scan_dir> <dir1> <dir2> <dir3> ...
 #
 # Options:
 #   --withSchema schema.prisma    Schema file to use for model lookups
-#   --scanDir <dir>               Directory to scan for base names (defaults to first directory)
 #   --outDir <dir>                Where to save output files (defaults to ~/Downloads)
-#   --watch                       Watch directories for changes and reprocess automatically
+#   --force                       Process all files on any change instead of only changed files
 #
 # Example:
-#   catAllFiles --withSchema prisma/schema.prisma --watch prisma/seeds prisma/mutations src/resolvers/
+#   catAllFilesWatch --withSchema prisma/schema.prisma prisma/seeds prisma/mutations src/resolvers/
 # -----------------------------------------------------------------------------
 
 # Process arguments
 SCHEMA_FILE=""
-SCAN_DIR=""
 OUTPUT_DIR=~/Downloads
-WATCH_MODE=false
+SCAN_DIR=""
+FORCE_MODE=false
 DIRECTORIES=()
 
 while [[ $# -gt 0 ]]; do
@@ -33,180 +32,239 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
-        --scanDir)
-            SCAN_DIR="$2"
-            if [ ! -d "$SCAN_DIR" ]; then
-                echo "Error: Scan directory '$SCAN_DIR' not found"
-                exit 1
-            fi
-            shift 2
-            ;;
         --outDir)
             OUTPUT_DIR="$2"
             shift 2
             ;;
-        --watch)
-            WATCH_MODE=true
+        --force)
+            FORCE_MODE=true
             shift
             ;;
         *)
-            DIRECTORIES+=("$1")
+            if [[ -z "$SCAN_DIR" ]]; then
+                SCAN_DIR="$1"
+            else
+                DIRECTORIES+=("$1")
+            fi
             shift
             ;;
     esac
 done
 
 # Validate arguments
-if [ ${#DIRECTORIES[@]} -eq 0 ]; then
-    echo "Error: No directories specified"
-    echo "Usage: $0 [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> ..."
+if [[ -z "$SCAN_DIR" ]]; then
+    echo "Error: No scan directory specified"
+    echo "Usage: $0 [--withSchema schema.prisma] [--outDir <dir>] <scan_dir> <dir1> <dir2> ..."
     exit 1
 fi
 
-# If no scan directory specified, use the first directory
-if [ -z "$SCAN_DIR" ]; then
-    SCAN_DIR="${DIRECTORIES[0]}"
+# Add scan dir to directories if not already included
+DIRECTORIES+=("$SCAN_DIR")
+
+# Remove duplicates from directories
+DIRECTORIES=($(printf "%s\n" "${DIRECTORIES[@]}" | sort -u))
+
+# Display watch mode
+if [ "$FORCE_MODE" = true ]; then
+    echo "🔄 Force mode enabled: Will process ALL files on any change"
+else
+    echo "🔍 Smart mode enabled: Will only process changed files"
 fi
 
-# Function to process all files
-process_files() {
-    # Create output directory
-    mkdir -p "$OUTPUT_DIR"
-    echo "Output files will be saved to: $OUTPUT_DIR"
+# Check if directories exist
+for dir in "${DIRECTORIES[@]}"; do
+    if [ ! -d "$dir" ]; then
+        echo "Warning: Directory '$dir' does not exist"
+    else
+        echo "Watching directory: $dir"
+    fi
+done
 
-    # Count and track files for summary
-    SUCCESSFUL=0
-    FAILED=0
-    PROCESSED=0
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+echo "Output files will be saved to: $OUTPUT_DIR"
 
-    # Get list of files to process
-    BASENAMES=()
-    for file in "$SCAN_DIR"/*; do
-        if [[ -f "$file" ]]; then
-            baseName=$(basename "$file" | cut -d '.' -f1)
-            BASENAMES+=("$baseName")
-        fi
-    done
+# Get list of base names from scan directory
+BASENAMES=()
+for file in "$SCAN_DIR"/*; do
+    if [[ -f "$file" ]]; then
+        baseName=$(basename "$file" | cut -d '.' -f1)
+        BASENAMES+=("$baseName")
+    fi
+done
 
-    echo "Found ${#BASENAMES[@]} base names to process in $SCAN_DIR"
+echo "Found ${#BASENAMES[@]} base names to process in $SCAN_DIR"
 
-    # Process each base name
-    for baseName in "${BASENAMES[@]}"; do
-        ((PROCESSED++))
-        outputFile="$OUTPUT_DIR/${baseName}-code.ts"
+# Process all base names
+process_all_files() {
+    echo "Processing all base names..."
+    local successful=0
+    local failed=0
+    local total=${#BASENAMES[@]}
+    
+    for ((i=0; i<total; i++)); do
+        local baseName="${BASENAMES[$i]}"
+        echo "[$(($i+1))/$total] Processing: $baseName"
         
-        echo "[$PROCESSED/${#BASENAMES[@]}] Processing: $baseName"
-        
-        # Add header with metadata
-        {
-            echo "// Generated by catAllFiles on $(date)"
-            echo "// Base name: $baseName"
-            echo "// Directories scanned: ${DIRECTORIES[*]}"
-            echo "// Schema file: ${SCHEMA_FILE:-None}"
-            echo ""
-            
-            # Run catFiles and capture output
-            if [[ -n "$SCHEMA_FILE" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
-            else
-                catFiles --grep "$baseName" "${DIRECTORIES[@]}"
-            fi
-        } > "$outputFile"
-        
-        # Check if file contains actual content beyond the header (5 lines)
-        if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
-            echo "✅ Processed $baseName -> $outputFile"
-            ((SUCCESSFUL++))
+        if process_file "$baseName"; then
+            ((successful++))
         else
-            echo "❌ No matching content found for $baseName"
-            rm "$outputFile"  # Remove empty files
-            ((FAILED++))
+            ((failed++))
         fi
     done
-
+    
     echo ""
     echo "Processing complete:"
-    echo "- Total processed: $PROCESSED"
-    echo "- Successful: $SUCCESSFUL"
-    echo "- No content found: $FAILED"
+    echo "- Total processed: $total"
+    echo "- Successful: $successful"
+    echo "- No content found: $failed"
     echo "- Output location: $OUTPUT_DIR"
 }
 
-# Execute once initially
-process_files
-
-# If watch mode is enabled, continue watching for changes
-if [ "$WATCH_MODE" = true ]; then
-    echo ""
-    echo "🔍 Watch mode enabled. Monitoring directories for changes..."
-    echo "Press Ctrl+C to stop watching."
+# Process a specific base name
+process_file() {
+    local baseName="$1"
+    local outputFile="$OUTPUT_DIR/${baseName}-code.ts"
     
-    # Determine which file watching tool to use
-    WATCH_TOOL=""
-    if command -v inotifywait >/dev/null 2>&1; then
-        WATCH_TOOL="inotifywait"
-    elif command -v fswatch >/dev/null 2>&1; then
-        WATCH_TOOL="fswatch"
+    echo "Processing: $baseName"
+    
+    # Add header with metadata
+    {
+        echo "// Generated by catAllFilesWatch on $(date)"
+        echo "// Base name: $baseName"
+        echo "// Directories scanned: ${DIRECTORIES[*]}"
+        echo "// Schema file: ${SCHEMA_FILE:-None}"
+        echo ""
+        
+        # Run catFiles and capture output
+        if [[ -n "$SCHEMA_FILE" ]]; then
+            catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+        else
+            catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+        fi
+    } > "$outputFile"
+    
+    # Check if file contains actual content beyond the header (5 lines)
+    if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
+        echo "✅ Processed $baseName -> $outputFile"
+        return 0
     else
-        echo "Error: No file watching tool found."
-        echo "Please install one of the following:"
-        echo "  - Linux: inotify-tools package (provides inotifywait)"
-        echo "  - macOS: fswatch (can be installed via Homebrew: brew install fswatch)"
-        exit 1
+        echo "❌ No matching content found for $baseName"
+        rm "$outputFile"  # Remove empty files
+        return 1
     fi
+}
+
+# Find base name from file path
+get_base_from_path() {
+    local file="$1"
+    local file_basename=$(basename "$file")
     
-    # Construct list of all directories to watch
-    WATCH_DIRS=("$SCAN_DIR")
-    for dir in "${DIRECTORIES[@]}"; do
-        # Only add if not already in the list
-        if [[ ! " ${WATCH_DIRS[*]} " =~ " ${dir} " ]]; then
-            WATCH_DIRS+=("$dir")
+    # Try to match with known base names
+    for base in "${BASENAMES[@]}"; do
+        if [[ "$file_basename" == *"$base"* ]]; then
+            echo "$base"
+            return 0
         fi
     done
     
-    # Add schema file directory if specified
-    if [ -n "$SCHEMA_FILE" ]; then
-        SCHEMA_DIR=$(dirname "$SCHEMA_FILE")
-        if [[ ! " ${WATCH_DIRS[*]} " =~ " ${SCHEMA_DIR} " ]]; then
-            WATCH_DIRS+=("$SCHEMA_DIR")
+    # If no match, return the base filename without extension
+    echo "${file_basename%.*}"
+    return 1
+}
+
+# Track file modification times
+declare -A FILE_TIMES
+
+# Initial scan to build baseline
+echo "Building initial file index..."
+total_files=0
+for dir in "${DIRECTORIES[@]}"; do
+    if [[ -d "$dir" ]]; then
+        while read -r file; do
+            if [[ -f "$file" ]]; then
+                # Get modification time
+                mod_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
+                FILE_TIMES["$file"]=$mod_time
+                ((total_files++))
+            fi
+        done < <(find "$dir" -type f -not -path "*/\.*" -not -path "*/node_modules/*" 2>/dev/null || echo "")
+    fi
+done
+
+echo "Watching $total_files files for changes..."
+echo "Press Ctrl+C to stop watching."
+
+# Set last run time
+LAST_RUN=$(date +%s)
+MIN_INTERVAL=2  # Minimum seconds between runs
+
+# Polling loop
+while true; do
+    sleep 1
+    changed=false
+    changed_files=()
+    
+    for dir in "${DIRECTORIES[@]}"; do
+        if [[ -d "$dir" ]]; then
+            while read -r file; do
+                if [[ -f "$file" ]]; then
+                    # Get current modification time
+                    current_time=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
+                    
+                    # If file is new or modified
+                    if [[ -z "${FILE_TIMES[$file]}" || "${FILE_TIMES[$file]}" != "$current_time" ]]; then
+                        changed=true
+                        changed_files+=("$file")
+                        FILE_TIMES["$file"]=$current_time
+                    fi
+                fi
+            done < <(find "$dir" -type f -not -path "*/\.*" -not -path "*/node_modules/*" 2>/dev/null || echo "")
+        fi
+    done
+    
+    # Process changed files
+    if [[ "$changed" == true ]]; then
+        CURRENT_TIME=$(date +%s)
+        if (( CURRENT_TIME - LAST_RUN >= MIN_INTERVAL )); then
+            echo ""
+            echo "🔄 Changes detected at $(date '+%H:%M:%S')!"
+            
+            # Show first 3 changed files (max)
+            for ((i=0; i<3 && i<${#changed_files[@]}; i++)); do
+                echo "- ${changed_files[$i]}"
+            done
+            
+            if [[ ${#changed_files[@]} -gt 3 ]]; then
+                echo "- ...and $((${#changed_files[@]} - 3)) more files"
+            fi
+            
+            # Process changes based on mode
+            if [ "$FORCE_MODE" = true ]; then
+                # Force mode: process all files
+                echo "Force mode: processing all files..."
+                process_all_files
+            else
+                # Smart mode: process only changed files
+                echo "Smart mode: processing changed files..."
+                # Process each changed file
+                processed=false
+                for file in "${changed_files[@]}"; do
+                    base=$(get_base_from_path "$file")
+                    if [[ -n "$base" ]]; then
+                        process_file "$base"
+                        processed=true
+                    fi
+                done
+                
+                # If no files were processed, inform the user
+                if [ "$processed" = false ]; then
+                    echo "ℹ️ No relevant files were found to process."
+                fi
+            fi
+            
+            LAST_RUN=$(date +%s)
+            echo "Watching for more changes... (Press Ctrl+C to stop)"
         fi
     fi
-    
-    echo "Watching directories: ${WATCH_DIRS[*]}"
-    
-    # Track last run time to prevent multiple runs in quick succession
-    LAST_RUN=$(date +%s)
-    MIN_INTERVAL=2  # Minimum seconds between runs
-    
-    # Start watching for changes based on available tool
-    if [ "$WATCH_TOOL" = "inotifywait" ]; then
-        echo "Using inotifywait for file monitoring..."
-        # Start watching for changes with inotifywait
-        while true; do
-            # Wait for any file changes in any of the watched directories
-            inotifywait -q -e modify,create,delete,move -r "${WATCH_DIRS[@]}" --exclude '\.git/'
-            
-            # Check if enough time has passed since last run
-            CURRENT_TIME=$(date +%s)
-            if (( CURRENT_TIME - LAST_RUN >= MIN_INTERVAL )); then
-                echo ""
-                echo "🔄 Changes detected! Re-processing files..."
-                process_files
-                LAST_RUN=$(date +%s)
-            fi
-        done
-    elif [ "$WATCH_TOOL" = "fswatch" ]; then
-        echo "Using fswatch for file monitoring..."
-        # Use fswatch to monitor changes and trigger processing
-        fswatch -o "${WATCH_DIRS[@]}" | while read; do
-            # Check if enough time has passed since last run
-            CURRENT_TIME=$(date +%s)
-            if (( CURRENT_TIME - LAST_RUN >= MIN_INTERVAL )); then
-                echo ""
-                echo "🔄 Changes detected! Re-processing files..."
-                process_files
-                LAST_RUN=$(date +%s)
-            fi
-        done
-    fi
-fi
+done
