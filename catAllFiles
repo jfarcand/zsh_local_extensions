@@ -4,16 +4,18 @@
 # catAllFiles: Calls catFiles on all base names found in directories.
 # -----------------------------------------------------------------------------
 # Usage:
-#   catAllFiles [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> <dir3> ...
+#   catAllFiles [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] 
+#               [--extra dir1,dir2,...] [--watch] <dir1> <dir2> <dir3> ...
 #
 # Options:
 #   --withSchema schema.prisma    Schema file to use for model lookups
 #   --scanDir <dir>               Directory to scan for base names (defaults to first directory)
 #   --outDir <dir>                Where to save output files (defaults to ~/Downloads)
+#   --extra dir1,dir2,...         Comma-separated list of directories to search for related files
 #   --watch                       Watch directories for changes and reprocess files
 #
 # Example:
-#   catAllFiles --withSchema prisma/schema.prisma --watch prisma/seeds prisma/mutations src/resolvers/
+#   catAllFiles --withSchema prisma/schema.prisma --extra services/api/graphql/queries,services/api/graphql/mutations --watch prisma/seeds src/resolvers/
 # -----------------------------------------------------------------------------
 
 # Process arguments
@@ -22,6 +24,7 @@ SCAN_DIR=""
 OUTPUT_DIR=~/Downloads
 WATCH_MODE=false
 DIRECTORIES=()
+EXTRA_DIRS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --extra)
+            EXTRA_DIRS="$2"
+            shift 2
+            ;;
         --watch)
             WATCH_MODE=true
             shift
@@ -59,7 +66,7 @@ done
 # Validate arguments
 if [ ${#DIRECTORIES[@]} -eq 0 ]; then
     echo "Error: No directories specified"
-    echo "Usage: $0 [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--watch] <dir1> <dir2> ..."
+    echo "Usage: $0 [--withSchema schema.prisma] [--scanDir <dir>] [--outDir <dir>] [--extra dir1,dir2,...] [--watch] <dir1> <dir2> ..."
     exit 1
 fi
 
@@ -77,6 +84,11 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 echo "Output files will be saved to: $OUTPUT_DIR"
+
+# Log extra directories if specified
+if [ -n "$EXTRA_DIRS" ]; then
+    echo "Will search for related files in: $EXTRA_DIRS"
+fi
 
 # Function to get base name from a file path
 get_base_name() {
@@ -116,6 +128,7 @@ process_all_files() {
             echo "// Base name: $baseName"
             echo "// Directories scanned: ${DIRECTORIES[*]}"
             echo "// Schema file: ${SCHEMA_FILE:-None}"
+            echo "// Extra directories: ${EXTRA_DIRS:-None}"
             echo ""
             
             # Run catFiles and capture output
@@ -125,22 +138,31 @@ process_all_files() {
                 local suffix="${baseName#[fF]auna}"
                 # Use regex pattern to match both lowercase and uppercase versions
                 local pattern="[fF]auna$suffix"
-                if [[ -n "$SCHEMA_FILE" ]]; then
+                
+                if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                elif [[ -n "$SCHEMA_FILE" ]]; then
                     catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                elif [[ -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$pattern" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
                 else
                     catFiles --grep "$pattern" "${DIRECTORIES[@]}"
                 fi
             else
-                if [[ -n "$SCHEMA_FILE" ]]; then
+                if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                elif [[ -n "$SCHEMA_FILE" ]]; then
                     catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                elif [[ -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$baseName" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
                 else
                     catFiles --grep "$baseName" "${DIRECTORIES[@]}"
                 fi
             fi
         } > "$outputFile"
         
-        # Check if file contains actual content beyond the header (5 lines)
-        if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
+        # Check if file contains actual content beyond the header (6 lines with the new extra dirs info)
+        if [[ $(wc -l < "$outputFile") -gt 6 ]]; then
             echo "✅ Processed $baseName -> $outputFile"
             ((SUCCESSFUL++))
         else
@@ -195,6 +217,14 @@ if [ "$WATCH_MODE" = true ]; then
     if [[ -n "$SCHEMA_FILE" ]]; then
         SCHEMA_DIR=$(dirname "$SCHEMA_FILE")
         WATCH_DIRS+=("$SCHEMA_DIR")
+    fi
+    
+    # Add extra directories to watch list if specified
+    if [[ -n "$EXTRA_DIRS" ]]; then
+        IFS=',' read -ra EXTRA_DIRS_ARRAY <<< "$EXTRA_DIRS"
+        for extraDir in "${EXTRA_DIRS_ARRAY[@]}"; do
+            WATCH_DIRS+=("$extraDir")
+        done
     fi
     
     # Remove duplicates
@@ -255,6 +285,7 @@ if [ "$WATCH_MODE" = true ]; then
             echo "// Base name: $baseName"
             echo "// Directories scanned: ${DIRECTORIES[*]}"
             echo "// Schema file: ${SCHEMA_FILE:-None}"
+            echo "// Extra directories: ${EXTRA_DIRS:-None}"
             echo ""
             
             # Run catFiles and capture output with the EXACT SAME command
@@ -264,22 +295,31 @@ if [ "$WATCH_MODE" = true ]; then
                 local suffix="${baseName#[fF]auna}"
                 # Use regex pattern to match both lowercase and uppercase versions
                 local pattern="[fF]auna$suffix"
-                if [[ -n "$SCHEMA_FILE" ]]; then
+                
+                if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                elif [[ -n "$SCHEMA_FILE" ]]; then
                     catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                elif [[ -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$pattern" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
                 else
                     catFiles --grep "$pattern" "${DIRECTORIES[@]}"
                 fi
             else
-                if [[ -n "$SCHEMA_FILE" ]]; then
+                if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                elif [[ -n "$SCHEMA_FILE" ]]; then
                     catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                elif [[ -n "$EXTRA_DIRS" ]]; then
+                    catFiles --grep "$baseName" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
                 else
                     catFiles --grep "$baseName" "${DIRECTORIES[@]}"
                 fi
             fi
         } > "$outputFile"
         
-        # Check if file contains actual content beyond the header (5 lines)
-        if [[ $(wc -l < "$outputFile") -gt 5 ]]; then
+        # Check if file contains actual content beyond the header (6 lines with extra dirs info)
+        if [[ $(wc -l < "$outputFile") -gt 6 ]]; then
             echo "✅ Processed $baseName -> $outputFile"
             return 0
         else
