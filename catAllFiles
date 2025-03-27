@@ -119,10 +119,23 @@ process_all_files() {
             echo ""
             
             # Run catFiles and capture output
-            if [[ -n "$SCHEMA_FILE" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+            # If base name starts with "fauna" or "Fauna", make it case-insensitive
+            if [[ "$baseName" =~ ^[fF]auna ]]; then
+                # Extract the part after "fauna" or "Fauna"
+                local suffix="${baseName#[fF]auna}"
+                # Use regex pattern to match both lowercase and uppercase versions
+                local pattern="[fF]auna$suffix"
+                if [[ -n "$SCHEMA_FILE" ]]; then
+                    catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                else
+                    catFiles --grep "$pattern" "${DIRECTORIES[@]}"
+                fi
             else
-                catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+                if [[ -n "$SCHEMA_FILE" ]]; then
+                    catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                else
+                    catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+                fi
             fi
         } > "$outputFile"
         
@@ -245,10 +258,23 @@ if [ "$WATCH_MODE" = true ]; then
             echo ""
             
             # Run catFiles and capture output with the EXACT SAME command
-            if [[ -n "$SCHEMA_FILE" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+            # If base name starts with "fauna" or "Fauna", make it case-insensitive
+            if [[ "$baseName" =~ ^[fF]auna ]]; then
+                # Extract the part after "fauna" or "Fauna"
+                local suffix="${baseName#[fF]auna}"
+                # Use regex pattern to match both lowercase and uppercase versions
+                local pattern="[fF]auna$suffix"
+                if [[ -n "$SCHEMA_FILE" ]]; then
+                    catFiles --grep "$pattern" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                else
+                    catFiles --grep "$pattern" "${DIRECTORIES[@]}"
+                fi
             else
-                catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+                if [[ -n "$SCHEMA_FILE" ]]; then
+                    catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                else
+                    catFiles --grep "$baseName" "${DIRECTORIES[@]}"
+                fi
             fi
         } > "$outputFile"
         
