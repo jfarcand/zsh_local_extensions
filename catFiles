@@ -182,6 +182,42 @@ get_base_name() {
     echo "$base"
 }
 
+# Function to extract smart base name that handles complex naming patterns
+extract_smart_base_name() {
+    local filename="$1"
+    local base_name="${filename%%.*}"  # Remove extension
+    
+    # Check for common suffixes first
+    local suffixes=("Store" "Service" "Controller" "Resolver" "Provider" "Manager" "Helper" "Util" "Utils")
+    local found_suffix=false
+    local stripped_name="$base_name"
+    
+    for suffix in "${suffixes[@]}"; do
+        if [[ "$base_name" == *"$suffix" ]]; then
+            # Found a suffix, remove it
+            stripped_name="${base_name%%$suffix}"
+            found_suffix=true
+            break
+        fi
+    done
+    
+    # If no common suffix was found, try to find the pattern boundary by looking for capital letters
+    if [[ "$found_suffix" == false ]]; then
+        # Keep as is, this is likely already the base name
+        echo "$base_name"
+        return
+    fi
+    
+    # Check if the stripped name has multiple capital letters (complex name pattern)
+    if [[ "$stripped_name" =~ [A-Z][a-z]+[A-Z] ]]; then
+        # We have a complex name with multiple uppercase words like PeuplementDetails
+        echo "$stripped_name"
+    else
+        # It's a simple name, return lowercase for better matching
+        echo "$stripped_name" | tr '[:upper:]' '[:lower:]'
+    fi
+}
+
 # Function to process a single file
 process_file() {
     local file="$1"
@@ -220,71 +256,78 @@ process_file() {
 # Function to process related files from extra paths
 process_related_files() {
     local mainFile="$1"
+    local fileName=$(basename "$mainFile")
     
-    # Get the normalized base name
+    # Get all possible base names for pattern matching
     local baseFileName=$(get_base_name "$mainFile")
+    local smartBaseName=$(extract_smart_base_name "$fileName")
     
-    # Create lowercase and capitalized versions for searching
+    # Debug for development
+    # echo "// DEBUG: fileName=$fileName, baseFileName=$baseFileName, smartBaseName=$smartBaseName" >&2
+    
+    # Arrays to store our search patterns
+    local patterns=()
+    
+    # Add the standard patterns from the file name
+    patterns+=("$baseFileName")
+    
+    # Add the lowercase and capitalized variants of the base name
     local lowercaseBase=$(echo "$baseFileName" | tr '[:upper:]' '[:lower:]')
     local capitalizedBase="$(tr '[:lower:]' '[:upper:]' <<< ${lowercaseBase:0:1})${lowercaseBase:1}"
     
-    # Look for files with lowercase or capitalized versions in all extra paths
-    for extraPath in "${EXTRA_PATHS[@]}"; do
-        # Find files matching lowercase pattern
-        while IFS= read -r extraFile; do
-            if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
-                PROCESSED_FILES+=("$extraFile")
-                echo "// $extraFile (related file - lowercase match)"
-                cat "$extraFile"
-                echo ""
-            fi
-        done < <(find "$extraPath" -type f -name "${lowercaseBase}.*" 2>/dev/null)
+    if [[ "$lowercaseBase" != "$baseFileName" ]]; then
+        patterns+=("$lowercaseBase")
+    fi
+    
+    if [[ "$capitalizedBase" != "$baseFileName" ]]; then
+        patterns+=("$capitalizedBase")
+    fi
+    
+    # Add the smart extracted base name if different
+    if [[ "$smartBaseName" != "$baseFileName" && "$smartBaseName" != "$lowercaseBase" && "$smartBaseName" != "$capitalizedBase" ]]; then
+        patterns+=("$smartBaseName")
         
-        # Find files matching capitalized pattern
-        while IFS= read -r extraFile; do
-            if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
-                PROCESSED_FILES+=("$extraFile")
-                echo "// $extraFile (related file - capitalized match)"
-                cat "$extraFile"
-                echo ""
-            fi
-        done < <(find "$extraPath" -type f -name "${capitalizedBase}.*" 2>/dev/null)
+        # Also add lowercase and capitalized variants of the smart base name
+        local lowercaseSmart=$(echo "$smartBaseName" | tr '[:upper:]' '[:lower:]')
+        local capitalizedSmart="$(tr '[:lower:]' '[:upper:]' <<< ${lowercaseSmart:0:1})${lowercaseSmart:1}"
         
-        # Try to be even more flexible if other attempts failed
-        # Extract meaningful part from compound filenames (e.g., PeuplementStore -> Peuplement)
-        if [[ "$baseFileName" == *"Store" || "$baseFileName" == *"Service" || "$baseFileName" == *"Controller" || "$baseFileName" == *"Resolver" ]]; then
-            local strippedBase="${baseFileName%%Store*}"
-            strippedBase="${strippedBase%%Service*}"
-            strippedBase="${strippedBase%%Controller*}"
-            strippedBase="${strippedBase%%Resolver*}"
-            
-            # Create lowercase and capitalized versions of the stripped base
-            local lowercaseStripped=$(echo "$strippedBase" | tr '[:upper:]' '[:lower:]')
-            local capitalizedStripped="$(tr '[:lower:]' '[:upper:]' <<< ${lowercaseStripped:0:1})${lowercaseStripped:1}"
-            
-            # Search for both versions if they differ from the original searches
-            if [[ "$lowercaseStripped" != "$lowercaseBase" ]]; then
-                while IFS= read -r extraFile; do
-                    if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
-                        PROCESSED_FILES+=("$extraFile")
-                        echo "// $extraFile (related file - stripped lowercase match)"
-                        cat "$extraFile"
-                        echo ""
-                    fi
-                done < <(find "$extraPath" -type f -name "${lowercaseStripped}.*" 2>/dev/null)
-            fi
-            
-            if [[ "$capitalizedStripped" != "$capitalizedBase" ]]; then
-                while IFS= read -r extraFile; do
-                    if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
-                        PROCESSED_FILES+=("$extraFile")
-                        echo "// $extraFile (related file - stripped capitalized match)"
-                        cat "$extraFile"
-                        echo ""
-                    fi
-                done < <(find "$extraPath" -type f -name "${capitalizedStripped}.*" 2>/dev/null)
-            fi
+        if [[ "$lowercaseSmart" != "$smartBaseName" ]]; then
+            patterns+=("$lowercaseSmart")
         fi
+        
+        if [[ "$capitalizedSmart" != "$smartBaseName" ]]; then
+            patterns+=("$capitalizedSmart")
+        fi
+    fi
+    
+    # Special handling for complex names like "NameName"
+    # Extract the first capitalized word if the smart base has multiple capitals
+    if [[ "$smartBaseName" =~ [A-Z][a-z]+[A-Z] ]]; then
+        # Use a regex to extract the first capitalized word
+        local firstCapWord=$(echo "$smartBaseName" | sed -E 's/([A-Z][a-z]+).*/\1/')
+        if [[ -n "$firstCapWord" && "$firstCapWord" != "$smartBaseName" ]]; then
+            patterns+=("$firstCapWord")
+            patterns+=("$(echo "$firstCapWord" | tr '[:upper:]' '[:lower:]')")
+        fi
+    fi
+    
+    # Remove duplicates from patterns
+    patterns=($(echo "${patterns[@]}" | tr ' ' '\n' | sort -u))
+    
+    # echo "// DEBUG: Searching with patterns: ${patterns[*]}" >&2
+    
+    # Look for files with our patterns in all extra paths
+    for extraPath in "${EXTRA_PATHS[@]}"; do
+        for pattern in "${patterns[@]}"; do
+            while IFS= read -r extraFile; do
+                if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
+                    PROCESSED_FILES+=("$extraFile")
+                    echo "// $extraFile (related file - matched with '$pattern')"
+                    cat "$extraFile"
+                    echo ""
+                fi
+            done < <(find "$extraPath" -type f -name "${pattern}.*" 2>/dev/null)
+        done
     done
 }
 
@@ -331,4 +374,4 @@ if [[ -n "$SCHEMA_FILE" ]]; then
     fi
 fi
 
-echo "// Processed ${#PROCESSED_FILES[@]} files total"gs
+echo "// Processed ${#PROCESSED_FILES[@]} files total"
