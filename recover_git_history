@@ -14,7 +14,7 @@ USAGE:
   
 OPTIONS:
   --path <folder_path>       Specify a folder path to recover
-  --folders <file1> <file2>  Specify specific files or folders to recover
+  --files <file1> <file2>  Specify specific files or folders to recover
   --commit <commit-hash>     Specify a particular commit to restore from
   --list-only                Only list files without restoring them
   --help                     Show this help message
@@ -22,7 +22,7 @@ OPTIONS:
 EXAMPLES:
   $(basename "$0") config.json                    # Recover a single file
   $(basename "$0") --path app/services/api/       # Recover entire folder
-  $(basename "$0") --path app/services/api/ --folders mocks  # Recover subfolder
+  $(basename "$0") --path app/services/api/ --files mocks  # Recover subfolder
   $(basename "$0") --commit abc123 config.json    # Recover from specific commit
 
 NOTE: 
@@ -166,11 +166,37 @@ restore_file() {
         
         # Restore each file in the folder
         for file in $FOLDER_FILES; do
-            # Calculate relative path for output
-            local rel_path="${file#$file_path/}"
-            if [ "$rel_path" = "$file" ]; then
-                # If the pattern didn't match, use basename
-                rel_path="$(basename "$file")"
+            # Extract the relevant part of the path
+            # First check if the file path matches our expected pattern directly
+            if [[ "$file" == *"$file_path/"* ]]; then
+                # Simple case - just extract the part after our folder path
+                local rel_path="${file#*$file_path/}"
+            else
+                # Handle more complex cases where the file might be in a different location
+                # Extract just the filename and folder structure after the last occurrence of our target folder name
+                local base_name=$(basename "$file_path")
+                local rel_path=$(echo "$file" | sed -E "s/.*\/$base_name\/(.+)/\1/")
+                
+                # If that didn't work, just use the full path structure
+                if [ "$rel_path" = "$file" ]; then
+                    # Try matching a simpler pattern
+                    rel_path=$(echo "$file" | grep -o "$base_name/.*/.*" || echo "")
+                    rel_path="${rel_path#$base_name/}"
+                    
+                    # If still no match, use relative path from repo root
+                    if [ -z "$rel_path" ]; then
+                        # Try to identify the project root path
+                        local repo_path=$(git rev-parse --show-toplevel 2>/dev/null)
+                        if [ ! -z "$repo_path" ] && [[ "$file" == *"$repo_path"* ]]; then
+                            rel_path="${file#$repo_path/}"
+                            # Remove any prefix before our target folder
+                            rel_path=$(echo "$rel_path" | sed -E "s/.*$base_name\/(.+)/\1/")
+                        else
+                            # Last resort - just use the basename
+                            rel_path="$(basename "$file")"
+                        fi
+                    fi
+                fi
             fi
             
             local file_output_path="$output_path/$rel_path"
@@ -346,7 +372,7 @@ while [[ $# -gt 0 ]]; do
             FOLDER_PATH="$2"
             shift 2
             ;;
-        --folders)
+        --files)
             shift
             # Collect all remaining arguments that don't start with --
             while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do
