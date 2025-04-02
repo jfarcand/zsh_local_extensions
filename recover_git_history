@@ -1,0 +1,469 @@
+#!/bin/bash
+
+# Git File Recovery Script
+# This script finds deleted files or folders in git history and restores them
+
+# Add helpful usage function
+usage() {
+    cat << EOF
+Git File Recovery Script
+This script helps recover deleted files or folders from git history.
+
+USAGE:
+  $(basename "$0") [options] <filename>
+  
+OPTIONS:
+  --path <folder_path>       Specify a folder path to recover
+  --folders <file1> <file2>  Specify specific files or folders to recover
+  --commit <commit-hash>     Specify a particular commit to restore from
+  --list-only                Only list files without restoring them
+  --help                     Show this help message
+
+EXAMPLES:
+  $(basename "$0") config.json                    # Recover a single file
+  $(basename "$0") --path app/services/api/       # Recover entire folder
+  $(basename "$0") --path app/services/api/ --folders mocks  # Recover subfolder
+  $(basename "$0") --commit abc123 config.json    # Recover from specific commit
+
+NOTE: 
+  Items without file extensions (like 'mocks') will be treated as folders.
+  The script will attempt multiple strategies to find deleted files.
+EOF
+    exit 0
+}
+
+# If no arguments or --help, show usage
+if [ $# -eq 0 ] || [ "$1" = "--help" ]; then
+    usage
+fi
+
+# Function to restore a specific file from git history
+restore_file() {
+    local file_path="$1"
+    local output_path="$2"
+    local is_folder="${3:-false}"
+    local specific_commit="${4:-}"
+    
+    echo "Searching for '$file_path' in git history..."
+    
+    # Check if path ends with slash for folder search
+    local search_path="$file_path"
+    if [ "$is_folder" = "true" ] && [[ ! "$search_path" =~ /$ ]]; then
+        search_path="${search_path}/"
+    fi
+    
+    # Find the last commit where the file or folder existed
+    if [ -z "$specific_commit" ]; then
+        COMMIT_HASH=$(git log --all --pretty=format:"%H" -- "$search_path" | head -n 1)
+    else
+        COMMIT_HASH="$specific_commit"
+        # Verify if this specific commit actually contains our file/folder
+        if ! git ls-tree -r --name-only "$COMMIT_HASH" | grep -q -F "$search_path"; then
+            echo "Warning: The specified commit does not seem to contain '$search_path'"
+            echo "Proceeding anyway as requested..."
+        fi
+    fi
+    
+    if [ -z "$COMMIT_HASH" ]; then
+        echo "Path '$file_path' not found in git history."
+        return 1
+    fi
+    
+    # Show the commit details
+    echo "Found in commit:"
+    git show --no-patch --format:"%h %an %ad %s" "$COMMIT_HASH"
+    
+    # Examine what changed in this commit regarding our file/folder
+    echo "Examining changes in commit $COMMIT_HASH..."
+    git show --name-status "$COMMIT_HASH" | grep -E "\s$search_path" || echo "No direct changes to $search_path in commit."
+    
+    # For debugging: look at the tree right before this commit
+    echo "Checking tree just before this commit..."
+    PARENT_COMMIT=$(git log -n 1 --pretty=format:"%P" "$COMMIT_HASH")
+    if [ ! -z "$PARENT_COMMIT" ]; then
+        echo "Parent commit: $PARENT_COMMIT"
+        PARENT_FILES=$(git ls-tree -r --name-only "$PARENT_COMMIT" | grep -E "$search_path|$(dirname "$search_path")" | sort)
+        echo "Files in/near $search_path before change:"
+        echo "$PARENT_FILES" | head -n 10
+        if [ $(echo "$PARENT_FILES" | wc -l) -gt 10 ]; then
+            echo "... (and $(echo "$PARENT_FILES" | wc -l | xargs) more)"
+        fi
+    fi
+    
+    # Actually try to restore the files
+    if [ "$is_folder" = "true" ]; then
+        # For folders, first try getting a list of all files
+        echo "Finding all files in folder at commit $COMMIT_HASH..."
+        
+        # Try multiple approaches to find files in the folder
+        FOLDER_FILES=""
+        
+        # Method 1: Try direct pattern match
+        FOLDER_FILES=$(git ls-tree -r --name-only "$COMMIT_HASH" | grep -F "$search_path" || echo "")
+        
+        # Method 2: If that didn't work, see if the folder might be in the diff
+        if [ -z "$FOLDER_FILES" ]; then
+            echo "No files found with direct match, checking diff..."
+            DIFF_FILES=$(git diff-tree --no-commit-id --name-only -r "$COMMIT_HASH" | grep -F "$search_path" || echo "")
+            if [ ! -z "$DIFF_FILES" ]; then
+                echo "Found files in diff:"
+                echo "$DIFF_FILES"
+                FOLDER_FILES="$DIFF_FILES"
+            fi
+        fi
+        
+        # Method 3: If still nothing, check parent commit
+        if [ -z "$FOLDER_FILES" ] && [ ! -z "$PARENT_COMMIT" ]; then
+            echo "Checking parent commit for files..."
+            FOLDER_FILES=$(git ls-tree -r --name-only "$PARENT_COMMIT" | grep -F "$search_path" || echo "")
+        fi
+        
+        # Method 4: If still nothing, try to find by path pattern
+        if [ -z "$FOLDER_FILES" ]; then
+            BASE_NAME=$(basename "$search_path" | sed 's|/$||')
+            echo "Searching for any path containing '$BASE_NAME'..."
+            ALL_FILES=$(git ls-tree -r --name-only "$COMMIT_HASH")
+            FOLDER_FILES=$(echo "$ALL_FILES" | grep -E "/$BASE_NAME/" || echo "")
+        fi
+        
+        if [ -z "$FOLDER_FILES" ]; then
+            echo "ERROR: No files found in folder '$file_path' at commit $COMMIT_HASH"
+            echo "This could mean:"
+            echo "1. The folder was empty (no files)"
+            echo "2. The folder was entirely deleted in this commit"
+            echo "3. Git history might have been rewritten"
+            
+            # Last resort - check other nearby commits
+            echo "Trying nearby commits..."
+            NEARBY_COMMITS=$(git log --all --pretty=format:"%H" -n 10)
+            
+            for NEARBY in $NEARBY_COMMITS; do
+                if [ "$NEARBY" != "$COMMIT_HASH" ]; then
+                    NEARBY_FILES=$(git ls-tree -r --name-only "$NEARBY" | grep -F "$file_path" || echo "")
+                    if [ ! -z "$NEARBY_FILES" ]; then
+                        echo "Found files in commit $NEARBY:"
+                        echo "$NEARBY_FILES" | head -n 5
+                        read -p "Use this commit instead? (y/n): " USE_COMMIT
+                        if [[ $USE_COMMIT == [yY] ]]; then
+                            COMMIT_HASH="$NEARBY"
+                            FOLDER_FILES="$NEARBY_FILES"
+                            break
+                        fi
+                    fi
+                fi
+            done
+        fi
+        
+        if [ -z "$FOLDER_FILES" ]; then
+            echo "Could not locate any files for folder '$file_path'"
+            return 1
+        fi
+        
+        echo "Found $(echo "$FOLDER_FILES" | wc -l | xargs) files in folder '$file_path'."
+        
+        # Create output directory
+        mkdir -p "$output_path"
+        
+        # Restore each file in the folder
+        for file in $FOLDER_FILES; do
+            # Calculate relative path for output
+            local rel_path="${file#$file_path/}"
+            if [ "$rel_path" = "$file" ]; then
+                # If the pattern didn't match, use basename
+                rel_path="$(basename "$file")"
+            fi
+            
+            local file_output_path="$output_path/$rel_path"
+            
+            # Create output directory if it doesn't exist
+            mkdir -p "$(dirname "$file_output_path")"
+            
+            # Try to restore the file - use git show first
+            if git show "$COMMIT_HASH":"$file" > "$file_output_path" 2>/dev/null; then
+                echo "Restored: $file_output_path"
+            else
+                # If that fails, try the parent commit
+                if [ ! -z "$PARENT_COMMIT" ] && git show "$PARENT_COMMIT":"$file" > "$file_output_path" 2>/dev/null; then
+                    echo "Restored (from parent): $file_output_path"
+                else
+                    echo "Failed to restore: $file"
+                fi
+            fi
+        done
+        
+        echo "Success! Folder '$file_path' has been restored to '$output_path'"
+        echo "Commit hash: $COMMIT_HASH"
+        return 0
+    else
+        # For individual files
+        # Get the full path of the file at that commit
+        ACTUAL_FILE_PATH=$(git ls-tree -r --name-only "$COMMIT_HASH" | grep -F "$file_path" || echo "")
+        
+        if [ -z "$ACTUAL_FILE_PATH" ]; then
+            # Check if it's in the diff
+            DIFF_PATH=$(git diff-tree --no-commit-id --name-only -r "$COMMIT_HASH" | grep -F "$file_path" || echo "")
+            
+            if [ ! -z "$DIFF_PATH" ]; then
+                ACTUAL_FILE_PATH="$DIFF_PATH"
+                echo "File found in the changes of this commit."
+            else
+                echo "Error: Could not determine file path at commit $COMMIT_HASH"
+                return 1
+            fi
+        fi
+        
+        # Create output directory if it doesn't exist
+        mkdir -p "$(dirname "$output_path")"
+        
+        # Restore the file from the commit
+        if git show "$COMMIT_HASH":"$ACTUAL_FILE_PATH" > "$output_path" 2>/dev/null; then
+            echo "Success! File has been restored to '$output_path'"
+            echo "Original file: $ACTUAL_FILE_PATH"
+            echo "Commit hash: $COMMIT_HASH"
+            return 0
+        else
+            # Try the parent commit
+            if [ ! -z "$PARENT_COMMIT" ] && git show "$PARENT_COMMIT":"$ACTUAL_FILE_PATH" > "$output_path" 2>/dev/null; then
+                echo "Success! File has been restored from parent commit to '$output_path'"
+                echo "Original file: $ACTUAL_FILE_PATH"
+                echo "Commit hash: $PARENT_COMMIT"
+                return 0
+            else
+                echo "Error occurred while restoring the file."
+                return 1
+            fi
+        fi
+    fi
+}
+
+# Function to restore a folder with all its contents
+restore_folder() {
+    local folder_path="$1"
+    local specific_files="$2"
+    local specific_commit="${3:-}"
+    
+    # Remove trailing slash if present
+    folder_path="${folder_path%/}"
+    
+    echo "Searching for folder '$folder_path' in git history..."
+    
+    # Find commits that affected files in the specified folder
+    FOLDER_COMMITS_CMD="git log --all --pretty=format:\"%H\" -- \"$folder_path/\" | head -n 50"
+    
+    if [ ! -z "$specific_commit" ]; then
+        echo "Using specified commit: $specific_commit"
+        FOLDER_COMMIT_HASH="$specific_commit"
+    else
+        FOLDER_COMMITS=$(eval "$FOLDER_COMMITS_CMD")
+        
+        if [ -z "$FOLDER_COMMITS" ]; then
+            echo "Folder '$folder_path' not found in git history."
+            return 1
+        fi
+        
+        # Find the most recent commit that contains the folder
+        for COMMIT in $FOLDER_COMMITS; do
+            # Check if the folder exists in this commit
+            FOLDER_EXISTS=$(git ls-tree -r --name-only "$COMMIT" | grep -F "$folder_path/" || echo "")
+            if [ ! -z "$FOLDER_EXISTS" ]; then
+                FOLDER_COMMIT_HASH="$COMMIT"
+                break
+            fi
+        done
+    fi
+    
+    if [ -z "$FOLDER_COMMIT_HASH" ]; then
+        echo "Error: Could not find a commit where folder '$folder_path' existed."
+        return 1
+    fi
+    
+    # Show the commit details
+    echo "Found folder in commit:"
+    git show --no-patch --format:"%h %an %ad %s" "$FOLDER_COMMIT_HASH"
+    
+    # If specific files are provided, restore only those files
+    if [ ! -z "$specific_files" ]; then
+        echo "Restoring specific files from folder '$folder_path'..."
+        
+        for file in $specific_files; do
+            # Form the full path
+            if [[ "$file" == /* ]]; then
+                # If file path is absolute
+                file_to_restore="$file"
+            else
+                # If file path is relative
+                file_to_restore="$folder_path/$file"
+            fi
+            
+            output_file="$file_to_restore"
+            
+            # Check if file might be a subfolder
+            if [[ ! "$file" == *"."* ]] || [[ "$file" == */ ]]; then
+                # Looks like a folder (no extension or ends with slash)
+                is_folder=true
+                echo "Treating '$file' as a subfolder..."
+                
+                # Check if the output directory already exists
+                if [ -d "$output_file" ] && [ "$(ls -A "$output_file" 2>/dev/null)" ]; then
+                    read -p "Directory '$output_file' already exists and is not empty. Continue? (y/n): " OVERWRITE
+                    if [[ $OVERWRITE != [yY] ]]; then
+                        echo "Skipping '$output_file'."
+                        continue
+                    fi
+                fi
+                
+                restore_file "$file_to_restore" "$output_file" true "$FOLDER_COMMIT_HASH"
+            else
+                # Looks like a regular file
+                # Check if the output file already exists
+                if [ -f "$output_file" ]; then
+                    read -p "File '$output_file' already exists. Overwrite? (y/n): " OVERWRITE
+                    if [[ $OVERWRITE != [yY] ]]; then
+                        echo "Skipping '$output_file'."
+                        continue
+                    fi
+                fi
+                
+                restore_file "$file_to_restore" "$output_file" false "$FOLDER_COMMIT_HASH"
+            fi
+        done
+    else
+        # Restore the entire folder structure
+        restore_file "$folder_path" "$folder_path" true "$FOLDER_COMMIT_HASH"
+    fi
+    
+    return 0
+}
+
+# Parse command line arguments
+SPECIFIC_COMMIT=""
+LIST_ONLY=false
+FOLDERS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --path)
+            FOLDER_PATH="$2"
+            shift 2
+            ;;
+        --folders)
+            shift
+            # Collect all remaining arguments that don't start with --
+            while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do
+                FOLDERS+=("$1")
+                shift
+            done
+            ;;
+        --commit)
+            SPECIFIC_COMMIT="$2"
+            shift 2
+            ;;
+        --list-only)
+            LIST_ONLY=true
+            shift
+            ;;
+        --help)
+            usage
+            ;;
+        *)
+            if [ -z "$FILE_TO_FIND" ]; then
+                FILE_TO_FIND="$1"
+            else
+                echo "Error: Unexpected argument '$1'"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Main script execution
+if [ ! -z "$SPECIFIC_COMMIT" ]; then
+    echo "Using specific commit: $SPECIFIC_COMMIT"
+fi
+
+if [ ! -z "$FOLDER_PATH" ]; then
+    # We're in folder recovery mode
+    echo "Folder recovery mode: $FOLDER_PATH"
+    
+    if [ ${#FOLDERS[@]} -gt 0 ]; then
+        echo "Recovering specific items from folder: ${FOLDERS[*]}"
+        for item in "${FOLDERS[@]}"; do
+            # Form the full path
+            if [[ "$item" == /* ]]; then
+                # If file path is absolute
+                item_path="$item"
+            else
+                # If file path is relative
+                item_path="$FOLDER_PATH/$item"
+            fi
+            
+            output_path="$item_path"
+            
+            # Check if item might be a subfolder (no extension or ends with slash)
+            if [[ ! "$item" == *"."* ]] || [[ "$item" == */ ]]; then
+                is_folder=true
+                echo "Treating '$item' as a subfolder..."
+                
+                # Check if the output directory already exists
+                if [ -d "$output_path" ] && [ "$(ls -A "$output_path" 2>/dev/null)" ]; then
+                    read -p "Directory '$output_path' already exists and is not empty. Continue? (y/n): " OVERWRITE
+                    if [[ $OVERWRITE != [yY] ]]; then
+                        echo "Skipping '$output_path'."
+                        continue
+                    fi
+                fi
+                
+                if [ "$LIST_ONLY" = "true" ]; then
+                    echo "Would restore folder: $item_path"
+                else
+                    restore_file "$item_path" "$output_path" true "$SPECIFIC_COMMIT"
+                fi
+            else
+                # Regular file
+                if [ -f "$output_path" ]; then
+                    read -p "File '$output_path' already exists. Overwrite? (y/n): " OVERWRITE
+                    if [[ $OVERWRITE != [yY] ]]; then
+                        echo "Skipping '$output_path'."
+                        continue
+                    fi
+                fi
+                
+                if [ "$LIST_ONLY" = "true" ]; then
+                    echo "Would restore file: $item_path"
+                else
+                    restore_file "$item_path" "$output_path" false "$SPECIFIC_COMMIT"
+                fi
+            fi
+        done
+    else
+        # Restore entire folder
+        if [ "$LIST_ONLY" = "true" ]; then
+            echo "Would restore entire folder: $FOLDER_PATH"
+        else
+            # Pass true as third argument to indicate folder
+            restore_folder "$FOLDER_PATH" "" "$SPECIFIC_COMMIT"
+        fi
+    fi
+elif [ ! -z "$FILE_TO_FIND" ]; then
+    # Single file recovery mode
+    OUTPUT_FILE="$FILE_TO_FIND"
+    
+    # Check if the output file already exists
+    if [ -f "$OUTPUT_FILE" ]; then
+        read -p "File '$OUTPUT_FILE' already exists. Overwrite? (y/n): " OVERWRITE
+        if [[ $OVERWRITE != [yY] ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    fi
+    
+    if [ "$LIST_ONLY" = "true" ]; then
+        echo "Would restore file: $FILE_TO_FIND"
+    else
+        restore_file "$FILE_TO_FIND" "$OUTPUT_FILE" false "$SPECIFIC_COMMIT"
+    fi
+else
+    echo "Error: No file or folder specified"
+    usage
+fi
