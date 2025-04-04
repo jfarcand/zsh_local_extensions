@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# Simple script to view Cloud Run job logs
+# Usage: ./cloudrun_logs_alt.sh JOB_NAME [REGION] [--all] [--limit=NUMBER]
+
+# Default values
+JOB_NAME=""
+REGION=""
+ALL_FLAG=false
+LOG_LIMIT=1000
+
+# Parse arguments
+for arg in "$@"; do
+  if [ "$arg" = "--all" ]; then
+    ALL_FLAG=true
+  elif [[ "$arg" == --limit=* ]]; then
+    LOG_LIMIT="${arg#*=}"
+  elif [ -z "$JOB_NAME" ]; then
+    JOB_NAME="$arg"
+  elif [ -z "$REGION" ]; then
+    REGION="$arg"
+  fi
+done
+
+# Set defaults if not provided
+JOB_NAME=${JOB_NAME:-"db-seed"}
+REGION=${REGION:-$(gcloud config get-value run/region)}
+
+# Debug output
+echo "Job: $JOB_NAME, Region: $REGION, All: $ALL_FLAG, Limit: $LOG_LIMIT" >&2
+
+if [ "$ALL_FLAG" = true ]; then
+  # Get latest execution ID
+  LATEST_EXECUTION_ID=$(gcloud run jobs executions list --job="$JOB_NAME" --region="$REGION" --limit=1 --format="value(metadata.name)" 2>/dev/null)
+  
+  if [ -n "$LATEST_EXECUTION_ID" ]; then
+    echo "Latest execution ID: $LATEST_EXECUTION_ID" >&2
+    
+    # This is the working command - using exactly what you confirmed works
+    gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=$JOB_NAME AND textPayload:*" \
+      --order=desc \
+      --limit=$LOG_LIMIT \
+      --format="value(textPayload)"
+  else
+    echo "No executions found for job: $JOB_NAME in region: $REGION" >&2
+    exit 1
+  fi
+else
+  # Regular mode - using exactly what you confirmed works
+  gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=$JOB_NAME AND textPayload:*" \
+    --order=desc \
+    --limit=$LOG_LIMIT \
+    --format="value(textPayload)"
+fi
