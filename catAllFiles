@@ -8,7 +8,7 @@
 #               [--extra dir1,dir2,...] [--watch] <dir1> <dir2> <dir3> ...
 #
 # Options:
-#   --withSchema schema.prisma    Schema file to use for model lookups
+#   --withSchema schema.prisma    Schema file to use for model lookups (case-insensitive)
 #   --scanDir <dir>               Directory to scan for base names (defaults to first directory)
 #   --outDir <dir>                Where to save output files (defaults to ~/Downloads)
 #   --extra dir1,dir2,...         Comma-separated list of directories to search for related files
@@ -90,6 +90,110 @@ if [ -n "$EXTRA_DIRS" ]; then
     echo "Will search for related files in: $EXTRA_DIRS"
 fi
 
+# Create modified catFiles wrapper function that adds case-insensitive support
+catFilesWithCaseSupport() {
+    local grep_pattern="$1"
+    shift
+    
+    # If --withSchema is provided, create a temporary wrapper script
+    if [[ "$*" == *"--withSchema"* ]]; then
+        # Create temporary wrapper script
+        local tmp_script=$(mktemp)
+        chmod +x "$tmp_script"
+        
+        # Write wrapper script that adds case-insensitive support
+        cat > "$tmp_script" << 'EOF'
+#!/usr/bin/env bash
+
+# Parse arguments to find grep pattern and schema file
+GREP_PATTERN=""
+SCHEMA_FILE=""
+OTHER_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --grep)
+            GREP_PATTERN="$2"
+            OTHER_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --withSchema)
+            SCHEMA_FILE="$2"
+            OTHER_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        *)
+            OTHER_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# If both grep pattern and schema file are provided, handle case-insensitive lookups
+if [[ -n "$GREP_PATTERN" && -n "$SCHEMA_FILE" ]]; then
+    # Extract base name (without any extension)
+    BASE_NAME=$(echo "$GREP_PATTERN" | cut -d '.' -f1)
+    
+    # Check if schema file exists
+    if [[ ! -f "$SCHEMA_FILE" ]]; then
+        echo "Error: Schema file not found: $SCHEMA_FILE"
+        exit 1
+    fi
+    
+    # Create a modified version of the schema file with lowercase model names for comparison
+    TMP_SCHEMA=$(mktemp)
+    
+    # Extract all model names from schema and create case-insensitive grep pattern
+    MODEL_PATTERN=""
+    while read -r line; do
+        if [[ "$line" =~ ^model[[:space:]]+ ]]; then
+            # Extract model name
+            model_name=$(echo "$line" | sed -E 's/^model[[:space:]]+([a-zA-Z0-9_]+).*/\1/')
+            
+            # Check if base name might match this model (case-insensitive)
+            if [[ "${model_name,,}" == "${BASE_NAME,,}" ]]; then
+                echo "Found matching model: $model_name for base name: $BASE_NAME (case-insensitive match)"
+                
+                # Modify grep pattern to include both original case and this model case
+                if [[ -z "$MODEL_PATTERN" ]]; then
+                    MODEL_PATTERN="$GREP_PATTERN|${model_name}"
+                else
+                    MODEL_PATTERN="$MODEL_PATTERN|${model_name}"
+                fi
+            fi
+        fi
+    done < "$SCHEMA_FILE"
+    
+    # If we found model matches, use the enhanced pattern
+    if [[ -n "$MODEL_PATTERN" ]]; then
+        # Call original catFiles with expanded pattern
+        catFiles --grep "$MODEL_PATTERN" "${OTHER_ARGS[@]}"
+    else
+        # No matches found, use original pattern
+        catFiles "${OTHER_ARGS[@]}"
+    fi
+    
+    # Clean up
+    rm -f "$TMP_SCHEMA"
+else
+    # Call original catFiles with all arguments
+    catFiles "${OTHER_ARGS[@]}"
+fi
+EOF
+        
+        # Call our wrapper script
+        "$tmp_script" --grep "$grep_pattern" "$@"
+        local result=$?
+        
+        # Clean up
+        rm -f "$tmp_script"
+        return $result
+    else
+        # No schema, just call original catFiles
+        catFiles --grep "$grep_pattern" "$@"
+    fi
+}
+
 # Function to get base name from a file path
 get_base_name() {
     local file_path="$1"
@@ -132,9 +236,9 @@ process_all_files() {
             echo ""
             
             if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                catFilesWithCaseSupport "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
             elif [[ -n "$SCHEMA_FILE" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                catFilesWithCaseSupport "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
             elif [[ -n "$EXTRA_DIRS" ]]; then
                 catFiles --grep "$baseName" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
             else
@@ -270,9 +374,9 @@ if [ "$WATCH_MODE" = true ]; then
             echo ""
         
             if [[ -n "$SCHEMA_FILE" && -n "$EXTRA_DIRS" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
+                catFilesWithCaseSupport "$baseName" --withSchema "$SCHEMA_FILE" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
             elif [[ -n "$SCHEMA_FILE" ]]; then
-                catFiles --grep "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
+                catFilesWithCaseSupport "$baseName" --withSchema "$SCHEMA_FILE" "${DIRECTORIES[@]}"
             elif [[ -n "$EXTRA_DIRS" ]]; then
                 catFiles --grep "$baseName" --extra "$EXTRA_DIRS" "${DIRECTORIES[@]}"
             else

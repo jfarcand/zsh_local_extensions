@@ -8,7 +8,27 @@
 #            [--extra ext1,ext2] [--extensions ext1,ext2] [--grep pattern] 
 #            [--withSchema schema.prisma] [paths...]
 #
-# Now enhanced to search for case variants in the first letter when matching in extra directories
+# Description:
+#   This script processes files, concatenating and displaying their contents 
+#   based on specified criteria. It supports filtering by file extensions, 
+#   excluding directories, and searching for filenames containing a specific 
+#   string (via --grep). It can also include relevant Prisma model definitions 
+#   from a schema file if `--withSchema` is used.
+#
+# Options:
+#   --root path         Set a root directory to prepend to file paths.
+#   --includes ext1,ext2
+#                       Include only specific file extensions (comma-separated).
+#   --excludes dir1,dir2
+#                       Exclude specific directories from processing.
+#   --extra ext1,ext2   Include additional related files (e.g., inputs, types).
+#   --extensions ext1,ext2
+#                       Set allowed file extensions (default: .ts, .tsx).
+#   --grep pattern      Filter filenames containing a specific pattern.
+#   --withSchema schema.prisma
+#                       Look up corresponding model definitions from schema.
+#   paths...            Files or directories to process.
+#
 # -----------------------------------------------------------------------------
 
 # Check if any arguments were provided
@@ -21,25 +41,17 @@ fi
 ROOT=""
 INCLUDES=()
 EXCLUDE_DIRS=()
-EXTENSIONS=(".ts" ".tsx")  # Default to .ts and .tsx files
+EXTENSIONS=(".ts" ".tsx" ".json" ".tf")  # Default to .ts and .tsx files
 EXTRA_PATHS=() # Extra paths to search for related files
 PATHS=()
 GREP_PATTERN=""  # Store grep pattern
 SCHEMA_FILE=""  # Store schema file path
 PROCESSED_FILES=() # Track processed files to avoid duplicates
 FOUND_MAIN_FILES=() # Track files found by grep to process extras for
-DEBUG_MODE=true  # Set to true for debugging
 
 # Create a temporary file to track processed models
 MODEL_TRACKER=$(mktemp)
 trap 'rm -f "$MODEL_TRACKER"' EXIT  # Remove temp file on exit
-
-# Enable debug logging function
-debug_log() {
-    if [[ "$DEBUG_MODE" == true ]]; then
-        echo "// DEBUG: $1" >&2
-    fi
-}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -250,8 +262,8 @@ process_related_files() {
     local baseFileName=$(get_base_name "$mainFile")
     local smartBaseName=$(extract_smart_base_name "$fileName")
     
-    debug_log "Processing related files for main file: $mainFile"
-    debug_log "  fileName=$fileName, baseFileName=$baseFileName, smartBaseName=$smartBaseName"
+    # Debug for development
+    # echo "// DEBUG: fileName=$fileName, baseFileName=$baseFileName, smartBaseName=$smartBaseName" >&2
     
     # Arrays to store our search patterns
     local patterns=()
@@ -263,30 +275,13 @@ process_related_files() {
     local lowercaseBase=$(echo "$baseFileName" | tr '[:upper:]' '[:lower:]')
     local capitalizedBase="$(tr '[:lower:]' '[:upper:]' <<< ${lowercaseBase:0:1})${lowercaseBase:1}"
     
-    # Always add both lowercase and capitalized variants
-    patterns+=("$lowercaseBase")
-    patterns+=("$capitalizedBase")
+    if [[ "$lowercaseBase" != "$baseFileName" ]]; then
+        patterns+=("$lowercaseBase")
+    fi
     
-    # For suffix detection - if we find something like "FaunaDetailsStore", 
-    # we should also look for "faunaDetails" and "FaunaDetails"
-    for suffix in "Store" "Service" "Controller" "Resolver" "Provider" "Manager" "Helper" "Util" "Utils"; do
-        if [[ "$baseFileName" == *"$suffix" ]]; then
-            # Found a suffix, extract the base without the suffix
-            local nameWithoutSuffix="${baseFileName%%$suffix}"
-            
-            debug_log "  Found suffix: $suffix in $baseFileName, base name without suffix: $nameWithoutSuffix"
-            
-            # Add both lowercase and uppercase first letter variants
-            local lcFirstLetter="$(tr '[:upper:]' '[:lower:]' <<< "${nameWithoutSuffix:0:1}")${nameWithoutSuffix:1}"
-            local ucFirstLetter="$(tr '[:lower:]' '[:upper:]' <<< "${nameWithoutSuffix:0:1}")${nameWithoutSuffix:1}"
-            
-            debug_log "  Adding case variants: $lcFirstLetter, $ucFirstLetter"
-            
-            patterns+=("$lcFirstLetter")
-            patterns+=("$ucFirstLetter")
-            break
-        fi
-    done
+    if [[ "$capitalizedBase" != "$baseFileName" ]]; then
+        patterns+=("$capitalizedBase")
+    fi
     
     # Add the smart extracted base name if different
     if [[ "$smartBaseName" != "$baseFileName" && "$smartBaseName" != "$lowercaseBase" && "$smartBaseName" != "$capitalizedBase" ]]; then
@@ -319,34 +314,19 @@ process_related_files() {
     # Remove duplicates from patterns
     patterns=($(echo "${patterns[@]}" | tr ' ' '\n' | sort -u))
     
-    debug_log "  Searching with patterns: ${patterns[*]}"
+    # echo "// DEBUG: Searching with patterns: ${patterns[*]}" >&2
     
     # Look for files with our patterns in all extra paths
     for extraPath in "${EXTRA_PATHS[@]}"; do
-        debug_log "  Searching in extra path: $extraPath"
         for pattern in "${patterns[@]}"; do
-            debug_log "    Looking for files matching pattern: $pattern"
-            # First, try filename-based matching
             while IFS= read -r extraFile; do
-                if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile" ]]; then
+                if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile"; then
                     PROCESSED_FILES+=("$extraFile")
-                    debug_log "    Found file by filename match: $extraFile"
                     echo "// $extraFile (related file - matched with '$pattern')"
                     cat "$extraFile"
                     echo ""
                 fi
             done < <(find "$extraPath" -type f -name "${pattern}.*" 2>/dev/null)
-            
-            # Next, try content-based matching
-            while IFS= read -r extraFile; do
-                if [[ -n "$extraFile" ]] && [[ -f "$extraFile" ]] && ! is_file_processed "$extraFile" ]]; then
-                    PROCESSED_FILES+=("$extraFile")
-                    debug_log "    Found file by content match: $extraFile"
-                    echo "// $extraFile (related file - content matched with '$pattern')"
-                    cat "$extraFile"
-                    echo ""
-                fi
-            done < <(find "$extraPath" -type f -exec grep -l "$pattern" {} \; 2>/dev/null)
         done
     done
 }
