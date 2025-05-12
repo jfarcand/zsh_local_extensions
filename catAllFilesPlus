@@ -15,7 +15,12 @@
 #   catAllFilesPlus --include-file stores/createGraphQLStore.ts --extra services/api/graphql/queries,services/api/graphql/mutations stores
 # -----------------------------------------------------------------------------
 
-echo "Starting catAllFilesPlus..."
+# Function to log with timestamp
+log_with_timestamp() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log_with_timestamp "Starting catAllFilesPlus..."
 
 # Parse arguments to find the --include-file parameter
 INCLUDE_FILE=""
@@ -29,7 +34,7 @@ while [[ $# -gt 0 ]]; do
         --include-file)
             INCLUDE_FILE="$2"
             if [ ! -f "$INCLUDE_FILE" ]; then
-                echo "Error: Include file '$INCLUDE_FILE' not found"
+                log_with_timestamp "Error: Include file '$INCLUDE_FILE' not found"
                 exit 1
             fi
             shift 2
@@ -47,24 +52,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INCLUDE_FILE" ]]; then
-    echo "Error: --include-file parameter is required"
-    echo "Usage: catAllFilesPlus --include-file <file> [--outDir <dir>] [catAllFiles options]"
+    log_with_timestamp "Error: --include-file parameter is required"
+    log_with_timestamp "Usage: catAllFilesPlus --include-file <file> [--outDir <dir>] [catAllFiles options]"
     exit 1
 fi
 
 # Create output directory
 mkdir -p "$OUT_DIR"
-echo "Output files will be saved to: $OUT_DIR"
+log_with_timestamp "Output files will be saved to: $OUT_DIR"
 
 # Create temp directory
 TEMP_DIR=$(mktemp -d)
-echo "Using temporary directory: $TEMP_DIR"
+log_with_timestamp "Using temporary directory: $TEMP_DIR"
 
 # Ensure cleanup on exit
-trap 'echo "Cleaning up..."; rm -rf "$TEMP_DIR"; exit' EXIT INT TERM
+trap 'log_with_timestamp "Cleaning up..."; rm -rf "$TEMP_DIR"; exit' EXIT INT TERM
 
 # Start catAllFiles in the background, redirecting to temp dir
-echo "Starting catAllFiles in the background..."
+log_with_timestamp "Starting catAllFiles in the background..."
 catAllFiles "${CATALLFILES_ARGS[@]}" --outDir "$TEMP_DIR" &
 CATALLFILES_PID=$!
 
@@ -111,11 +116,11 @@ process_file() {
         cat "$input_file"
     } > "$output_file"
     
-    echo "✨ Enhanced file saved to: $output_file"
+    log_with_timestamp "✨ Enhanced file saved to: $output_file"
 }
 
-echo "Starting file monitoring..."
-echo "Press Ctrl+C to stop."
+log_with_timestamp "Starting file monitoring..."
+log_with_timestamp "Press Ctrl+C to stop."
 
 # Initial processing of any files that might be created right away
 sleep 2
@@ -128,7 +133,7 @@ done
 # Monitor temp directory for changes using inotifywait if available,
 # otherwise fall back to polling
 if command -v inotifywait >/dev/null 2>&1; then
-    echo "Using filesystem events for monitoring"
+    log_with_timestamp "Using filesystem events for monitoring"
     while true; do
         inotifywait -q -e create -e modify "$TEMP_DIR" >/dev/null 2>&1
         for f in "$TEMP_DIR"/*-code.ts; do
@@ -138,7 +143,7 @@ if command -v inotifywait >/dev/null 2>&1; then
         done
     done
 else
-    echo "Using polling for monitoring (every 1 second)"
+    log_with_timestamp "Using polling for monitoring (every 1 second)"
     while true; do
         sleep 1
         for f in "$TEMP_DIR"/*-code.ts; do
