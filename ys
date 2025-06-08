@@ -1,9 +1,22 @@
 #!/bin/bash
 
 DEBUG=TRUE yarn start:debug | while IFS= read -r line; do
-  if echo "$line" | jq -e . >/dev/null 2>&1; then
-    echo "$line" | jq .
-  else
-    echo "$line"
+  # Skip empty lines
+  if [ -z "$line" ]; then
+    echo ""
+    continue
   fi
+  
+  # Try to parse as JSON
+  if echo "$line" | grep -q '^{.*}$' || echo "$line" | grep -q '^\[.*\]$'; then
+    if formatted=$(echo "$line" | jq 2>/dev/null); then
+      if [ "$formatted" != "null" ]; then
+        echo "$formatted"
+        continue
+      fi
+    fi
+  fi
+  
+  # Default: print the original line
+  echo "$line"
 done
