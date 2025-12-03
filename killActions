@@ -1,0 +1,236 @@
+#!/bin/bash
+# ABOUTME: Kill GitHub Actions workflow runs by branch or kill all except a specific branch
+# ABOUTME: Uses gh CLI to cancel in_progress and queued workflow runs
+
+set -e
+
+# Default limit for gh run list
+LIMIT=30
+WATCH=false
+WATCH_INTERVAL=10
+
+usage() {
+    cat << EOF
+Usage: killActions [OPTIONS]
+
+Kill GitHub Actions workflow runs.
+
+Options:
+  -b, --branch <name>      Cancel all runs for a specific branch
+  -a, --all                Cancel all runs (use with -e to exclude a branch)
+  -e, --except <name>      Exclude a branch when using --all
+  -l, --last <n>           Fetch last N runs (default: $LIMIT)
+  -w, --watch              Watch until all runs complete, then show final status
+  -h, --help               Show this help message
+
+Examples:
+  killActions -b main                  # Cancel all runs on 'main' branch
+  killActions -b feature/foo           # Cancel all runs on 'feature/foo' branch
+  killActions -a -e main               # Cancel all runs EXCEPT those on 'main'
+  killActions --all --except main      # Same as above (long form)
+  killActions -a -e main -l 50         # Check last 50 runs, cancel all except 'main'
+  killActions -a -e main --last 100    # Check last 100 runs
+  killActions -a -e main -w            # Cancel and watch until all complete
+
+Note: Only cancels 'in_progress' and 'queued' runs.
+EOF
+    exit 0
+}
+
+list_active_runs() {
+    echo ""
+    echo "📋 Current active runs:"
+    local runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name,status --jq '.[] | "  #\(.databaseId) [\(.status)] \(.headBranch) - \(.name)"' 2>/dev/null)
+    runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name,status --jq '.[] | "  #\(.databaseId) [\(.status)] \(.headBranch) - \(.name)"' 2>/dev/null)
+
+    runs=$(echo "$runs" | grep -v '^$' | sort -u)
+
+    if [ -z "$runs" ]; then
+        echo "  ✅ No active runs"
+        return 1
+    else
+        echo "$runs"
+        return 0
+    fi
+}
+
+watch_until_complete() {
+    echo ""
+    echo "👀 Watching for completion (Ctrl+C to stop)..."
+    echo ""
+
+    while true; do
+        local in_progress=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId --jq 'length' 2>/dev/null || echo "0")
+        local queued=$(gh run list --status queued --limit "$LIMIT" --json databaseId --jq 'length' 2>/dev/null || echo "0")
+        local total=$((in_progress + queued))
+
+        if [ "$total" -eq 0 ]; then
+            echo "✅ All runs completed!"
+            echo ""
+            echo "📊 Recent run results:"
+            gh run list --limit 10 --json databaseId,headBranch,name,status,conclusion --jq '.[] | "  #\(.databaseId) [\(.conclusion // .status)] \(.headBranch) - \(.name)"' 2>/dev/null
+            break
+        else
+            printf "\r⏳ Still running: %d in_progress, %d queued (checking every %ds)..." "$in_progress" "$queued" "$WATCH_INTERVAL"
+            sleep "$WATCH_INTERVAL"
+        fi
+    done
+}
+
+cancel_runs_for_branch() {
+    local branch="$1"
+    echo "🔍 Finding in_progress/queued runs for branch: $branch (last $LIMIT runs)"
+
+    local run_ids=$(gh run list --branch "$branch" --status in_progress --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null)
+    run_ids+=$'\n'$(gh run list --branch "$branch" --status queued --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null)
+
+    run_ids=$(echo "$run_ids" | grep -v '^$' | sort -u)
+
+    if [ -z "$run_ids" ]; then
+        echo "✅ No active runs found for branch: $branch"
+        return 0
+    fi
+
+    local count=$(echo "$run_ids" | wc -l | tr -d ' ')
+    echo "🎯 Found $count run(s) to cancel on branch: $branch"
+
+    echo "$run_ids" | while read -r run_id; do
+        if [ -n "$run_id" ]; then
+            echo "  ❌ Canceling run #$run_id..."
+            gh run cancel "$run_id" 2>/dev/null || echo "    ⚠️  Could not cancel #$run_id (may have already completed)"
+        fi
+    done
+
+    echo "✅ Done canceling runs for branch: $branch"
+}
+
+cancel_all_except_branch() {
+    local except_branch="$1"
+    echo "🔍 Finding all in_progress/queued runs (excluding: $except_branch, last $LIMIT runs)"
+
+    # Get all runs with branch info
+    local all_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch --jq '.[] | "\(.databaseId) \(.headBranch)"' 2>/dev/null)
+    all_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch --jq '.[] | "\(.databaseId) \(.headBranch)"' 2>/dev/null)
+
+    all_runs=$(echo "$all_runs" | grep -v '^$' | sort -u)
+
+    if [ -z "$all_runs" ]; then
+        echo "✅ No active runs found"
+        return 0
+    fi
+
+    local canceled=0
+    local skipped=0
+
+    echo "$all_runs" | while read -r line; do
+        if [ -n "$line" ]; then
+            local run_id=$(echo "$line" | awk '{print $1}')
+            local branch=$(echo "$line" | awk '{print $2}')
+
+            if [ "$branch" = "$except_branch" ]; then
+                echo "  ⏭️  Skipping run #$run_id (branch: $branch)"
+                ((skipped++)) || true
+            else
+                echo "  ❌ Canceling run #$run_id (branch: $branch)..."
+                gh run cancel "$run_id" 2>/dev/null || echo "    ⚠️  Could not cancel #$run_id"
+                ((canceled++)) || true
+            fi
+        fi
+    done
+
+    echo "✅ Done. Canceled runs, skipped runs on '$except_branch'"
+}
+
+# Parse arguments
+BRANCH=""
+ALL=false
+EXCEPT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--branch)
+            BRANCH="$2"
+            shift 2
+            ;;
+        -a|--all)
+            ALL=true
+            shift
+            ;;
+        -e|--except)
+            EXCEPT="$2"
+            shift 2
+            ;;
+        -l|--last)
+            LIMIT="$2"
+            shift 2
+            ;;
+        -w|--watch)
+            WATCH=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "❌ Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Validate arguments
+if [ -n "$BRANCH" ] && [ "$ALL" = true ]; then
+    echo "❌ Error: Cannot use both --branch and --all"
+    exit 1
+fi
+
+if [ -z "$BRANCH" ] && [ "$ALL" = false ]; then
+    echo "❌ Error: Must specify either --branch or --all"
+    usage
+fi
+
+if [ "$ALL" = true ] && [ -z "$EXCEPT" ]; then
+    echo "⚠️  Warning: --all without --except will cancel ALL runs!"
+    read -p "Are you sure? (y/N) " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# Execute
+if [ -n "$BRANCH" ]; then
+    cancel_runs_for_branch "$BRANCH"
+elif [ "$ALL" = true ]; then
+    if [ -n "$EXCEPT" ]; then
+        cancel_all_except_branch "$EXCEPT"
+    else
+        # Cancel everything
+        echo "🔍 Finding ALL in_progress/queued runs (last $LIMIT runs)..."
+        run_ids=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null)
+        run_ids+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null)
+        run_ids=$(echo "$run_ids" | grep -v '^$' | sort -u)
+
+        if [ -z "$run_ids" ]; then
+            echo "✅ No active runs found"
+            exit 0
+        fi
+
+        echo "$run_ids" | while read -r run_id; do
+            if [ -n "$run_id" ]; then
+                echo "  ❌ Canceling run #$run_id..."
+                gh run cancel "$run_id" 2>/dev/null || echo "    ⚠️  Could not cancel #$run_id"
+            fi
+        done
+        echo "✅ Done canceling all runs"
+    fi
+fi
+
+# Always list remaining active runs at the end
+list_active_runs
+has_active=$?
+
+# Watch mode if requested and there are still active runs
+if [ "$WATCH" = true ] && [ "$has_active" -eq 0 ]; then
+    watch_until_complete
+fi
