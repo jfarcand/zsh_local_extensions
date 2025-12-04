@@ -55,18 +55,66 @@ list_active_runs() {
 }
 
 watch_until_complete() {
-    echo ""
-    echo "👀 Watching for completion (Ctrl+C to stop)..."
-    echo ""
-
+    local filter_branch="$1"
     # Track previous run IDs to detect completions
     local prev_run_ids=""
+    # Track all completions for display
+    local completed_runs=""
+    # Track head SHAs of runs we're watching (to group related runs)
+    local watched_shas=""
 
     while true; do
-        # Get current active runs with details
-        local current_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
-        current_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
+        # Get current active runs with details (including createdAt and headSha for grouping)
+        local current_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name,createdAt,headSha --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)|\(.createdAt)|\(.headSha)"' 2>/dev/null)
+        current_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name,createdAt,headSha --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)|\(.createdAt)|\(.headSha)"' 2>/dev/null)
         current_runs=$(echo "$current_runs" | grep -v '^$' | sort -u)
+
+        # On first run, collect the head SHAs we're watching
+        if [ -z "$watched_shas" ]; then
+            watched_shas=$(echo "$current_runs" | cut -d'|' -f5 | sort -u | tr '\n' '|')
+
+            # Fetch completed runs with matching SHAs (same commit batch)
+            if [ -n "$watched_shas" ]; then
+                local recent_completed
+                if [ -n "$filter_branch" ]; then
+                    recent_completed=$(gh run list --branch "$filter_branch" --status completed --limit 20 --json databaseId,headBranch,name,conclusion,createdAt,updatedAt,headSha 2>/dev/null)
+                else
+                    recent_completed=$(gh run list --status completed --limit 20 --json databaseId,headBranch,name,conclusion,createdAt,updatedAt,headSha 2>/dev/null)
+                fi
+                if [ -n "$recent_completed" ]; then
+                    while read -r line; do
+                        local sha=$(echo "$line" | jq -r '.headSha')
+                        # Only include if SHA matches one of our watched runs
+                        if echo "$watched_shas" | grep -qF "$sha"; then
+                            local run_id=$(echo "$line" | jq -r '.databaseId')
+                            local conclusion=$(echo "$line" | jq -r '.conclusion')
+                            local branch=$(echo "$line" | jq -r '.headBranch')
+                            local name=$(echo "$line" | jq -r '.name')
+                            local created=$(echo "$line" | jq -r '.createdAt')
+                            local updated=$(echo "$line" | jq -r '.updatedAt')
+                            # Calculate duration
+                            local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created%.*}Z" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
+                            local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${updated%.*}Z" "+%s" 2>/dev/null || date -d "$updated" "+%s" 2>/dev/null)
+                            local duration_str=""
+                            if [ -n "$start_ts" ] && [ -n "$end_ts" ]; then
+                                local dur=$((end_ts - start_ts))
+                                if [ "$dur" -ge 3600 ]; then
+                                    duration_str="$((dur / 3600))h$((dur % 3600 / 60))m"
+                                elif [ "$dur" -ge 60 ]; then
+                                    duration_str="$((dur / 60))m$((dur % 60))s"
+                                else
+                                    duration_str="${dur}s"
+                                fi
+                            fi
+                            local icon="✓"
+                            [ "$conclusion" = "failure" ] && icon="✗"
+                            [ "$conclusion" = "cancelled" ] && icon="⊘"
+                            completed_runs+="  $icon #$run_id [$conclusion] $branch - $name ($duration_str)"$'\n'
+                        fi
+                    done < <(echo "$recent_completed" | jq -c '.[]')
+                fi
+            fi
+        fi
 
         local current_ids=$(echo "$current_runs" | cut -d'|' -f1 | sort -u | tr '\n' '|')
 
@@ -75,14 +123,8 @@ watch_until_complete() {
             prev_run_ids="$current_ids"
         else
             # Check for completed runs (were in prev but not in current)
-            local has_completions=false
             for prev_id in $(echo "$prev_run_ids" | tr '|' '\n' | grep -v '^$'); do
                 if ! echo "$current_ids" | grep -qF "|${prev_id}|" && ! echo "$current_ids" | grep -q "^${prev_id}|"; then
-                    # Clear status line before printing completion
-                    if [ "$has_completions" = false ]; then
-                        printf "\r%80s\r" ""
-                        has_completions=true
-                    fi
                     # This run completed - get its final status with duration
                     local run_data=$(gh run view "$prev_id" --json conclusion,name,headBranch,createdAt,updatedAt 2>/dev/null)
                     if [ -n "$run_data" ]; then
@@ -105,7 +147,11 @@ watch_until_complete() {
                                 duration_str="${dur}s"
                             fi
                         fi
-                        echo "  ✓ #$prev_id [$conclusion] $branch - $name ($duration_str)"
+                        # Add to completed runs list
+                        local icon="✓"
+                        [ "$conclusion" = "failure" ] && icon="✗"
+                        [ "$conclusion" = "cancelled" ] && icon="⊘"
+                        completed_runs+="  $icon #$prev_id [$conclusion] $branch - $name ($duration_str)"$'\n'
                     fi
                 fi
             done
@@ -115,15 +161,47 @@ watch_until_complete() {
         local in_progress
         in_progress=$(echo "$current_runs" | grep -c '.' 2>/dev/null) || in_progress=0
 
+        # Clear screen and redraw
+        printf "\033[2J\033[H"
+        echo "👀 Watching for completion (Ctrl+C to stop)..."
+        echo ""
+
+        # Show completed runs
+        if [ -n "$completed_runs" ]; then
+            echo "📋 Completed:"
+            echo "$completed_runs" | grep -v '^$'
+            echo "────────────────────────────────────────────────────────────"
+        fi
+
         if [ "$in_progress" -eq 0 ]; then
-            printf "\r%80s\r" ""
-            echo "✅ All runs completed!"
             echo ""
-            echo "📊 Recent run results: (gh run list --limit 10)"
-            gh run list --limit 10 --json databaseId,headBranch,name,status,conclusion --jq '.[] | "  #\(.databaseId) [\(.conclusion // .status)] \(.headBranch) - \(.name)"' 2>/dev/null
+            echo "✅ All runs completed!"
             break
         else
-            printf "⏳ Still running: %d active (checking every %ds)...\r" "$in_progress" "$WATCH_INTERVAL"
+            # Show running workflows with elapsed time
+            echo "🔄 Running ($in_progress active):"
+            local now_ts=$(date "+%s")
+            echo "$current_runs" | while IFS='|' read -r run_id branch name created headsha || [ -n "$run_id" ]; do
+                if [ -n "$run_id" ]; then
+                    local elapsed_str=""
+                    if [ -n "$created" ]; then
+                        local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created%.*}Z" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
+                        if [ -n "$start_ts" ]; then
+                            local elapsed=$((now_ts - start_ts))
+                            if [ "$elapsed" -ge 3600 ]; then
+                                elapsed_str="$((elapsed / 3600))h$((elapsed % 3600 / 60))m"
+                            elif [ "$elapsed" -ge 60 ]; then
+                                elapsed_str="$((elapsed / 60))m$((elapsed % 60))s"
+                            else
+                                elapsed_str="${elapsed}s"
+                            fi
+                        fi
+                    fi
+                    echo "  ⏳ #$run_id $branch - $name ($elapsed_str)"
+                fi
+            done
+            echo ""
+            echo "(checking every ${WATCH_INTERVAL}s...)"
             sleep "$WATCH_INTERVAL"
         fi
     done
@@ -296,5 +374,6 @@ has_active=$?
 
 # Watch mode if requested and there are still active runs
 if [ "$WATCH" = true ] && [ "$has_active" -eq 0 ]; then
-    watch_until_complete
+    # Pass branch filter: use EXCEPT if set, otherwise BRANCH
+    watch_until_complete "${EXCEPT:-$BRANCH}"
 fi
