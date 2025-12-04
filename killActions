@@ -1,5 +1,5 @@
 #!/bin/bash
-# ABOUTME: Kill GitHub Actions workflow runs by branch or kill all except a specific branch
+# ABOUTME: Kill GitHub Actions workflow runs by branch or keep only latest per workflow on a branch
 # ABOUTME: Uses gh CLI to cancel in_progress and queued workflow runs
 
 set -e
@@ -17,8 +17,8 @@ Kill GitHub Actions workflow runs.
 
 Options:
   -b, --branch <name>      Cancel all runs for a specific branch
-  -a, --all                Cancel all runs (use with -e to exclude a branch)
-  -e, --except <name>      Exclude a branch when using --all
+  -a, --all                Cancel all runs (use with -e to keep latest per workflow)
+  -e, --except <name>      Keep only the LATEST run per workflow on this branch
   -l, --last <n>           Fetch last N runs (default: $LIMIT)
   -w, --watch              Watch until all runs complete, then show final status
   -h, --help               Show this help message
@@ -26,9 +26,9 @@ Options:
 Examples:
   killActions -b main                  # Cancel all runs on 'main' branch
   killActions -b feature/foo           # Cancel all runs on 'feature/foo' branch
-  killActions -a -e main               # Cancel all runs EXCEPT those on 'main'
+  killActions -a -e main               # Keep only LATEST per workflow on main, cancel rest
   killActions --all --except main      # Same as above (long form)
-  killActions -a -e main -l 50         # Check last 50 runs, cancel all except 'main'
+  killActions -a -e main -l 50         # Check last 50 runs
   killActions -a -e main --last 100    # Check last 100 runs
   killActions -a -e main -w            # Cancel and watch until all complete
 
@@ -39,7 +39,7 @@ EOF
 
 list_active_runs() {
     echo ""
-    echo "📋 Current active runs:"
+    echo "📋 Current active runs: (gh run list --status in_progress)"
     local runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name,status --jq '.[] | "  #\(.databaseId) [\(.status)] \(.headBranch) - \(.name)"' 2>/dev/null)
     runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name,status --jq '.[] | "  #\(.databaseId) [\(.status)] \(.headBranch) - \(.name)"' 2>/dev/null)
 
@@ -59,19 +59,71 @@ watch_until_complete() {
     echo "👀 Watching for completion (Ctrl+C to stop)..."
     echo ""
 
-    while true; do
-        local in_progress=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId --jq 'length' 2>/dev/null || echo "0")
-        local queued=$(gh run list --status queued --limit "$LIMIT" --json databaseId --jq 'length' 2>/dev/null || echo "0")
-        local total=$((in_progress + queued))
+    # Track previous run IDs to detect completions
+    local prev_run_ids=""
 
-        if [ "$total" -eq 0 ]; then
+    while true; do
+        # Get current active runs with details
+        local current_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
+        current_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
+        current_runs=$(echo "$current_runs" | grep -v '^$' | sort -u)
+
+        local current_ids=$(echo "$current_runs" | cut -d'|' -f1 | sort -u | tr '\n' '|')
+
+        # On first run, just record the IDs
+        if [ -z "$prev_run_ids" ]; then
+            prev_run_ids="$current_ids"
+        else
+            # Check for completed runs (were in prev but not in current)
+            local has_completions=false
+            for prev_id in $(echo "$prev_run_ids" | tr '|' '\n' | grep -v '^$'); do
+                if ! echo "$current_ids" | grep -qF "|${prev_id}|" && ! echo "$current_ids" | grep -q "^${prev_id}|"; then
+                    # Clear status line before printing completion
+                    if [ "$has_completions" = false ]; then
+                        printf "\r%80s\r" ""
+                        has_completions=true
+                    fi
+                    # This run completed - get its final status with duration
+                    local run_data=$(gh run view "$prev_id" --json conclusion,name,headBranch,createdAt,updatedAt 2>/dev/null)
+                    if [ -n "$run_data" ]; then
+                        local conclusion=$(echo "$run_data" | jq -r '.conclusion')
+                        local branch=$(echo "$run_data" | jq -r '.headBranch')
+                        local name=$(echo "$run_data" | jq -r '.name')
+                        local created=$(echo "$run_data" | jq -r '.createdAt')
+                        local updated=$(echo "$run_data" | jq -r '.updatedAt')
+                        # Calculate duration in seconds using date
+                        local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created%.*}Z" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
+                        local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${updated%.*}Z" "+%s" 2>/dev/null || date -d "$updated" "+%s" 2>/dev/null)
+                        local duration_str=""
+                        if [ -n "$start_ts" ] && [ -n "$end_ts" ]; then
+                            local dur=$((end_ts - start_ts))
+                            if [ "$dur" -ge 3600 ]; then
+                                duration_str="$((dur / 3600))h$((dur % 3600 / 60))m"
+                            elif [ "$dur" -ge 60 ]; then
+                                duration_str="$((dur / 60))m$((dur % 60))s"
+                            else
+                                duration_str="${dur}s"
+                            fi
+                        fi
+                        echo "  ✓ #$prev_id [$conclusion] $branch - $name ($duration_str)"
+                    fi
+                fi
+            done
+            prev_run_ids="$current_ids"
+        fi
+
+        local in_progress
+        in_progress=$(echo "$current_runs" | grep -c '.' 2>/dev/null) || in_progress=0
+
+        if [ "$in_progress" -eq 0 ]; then
+            printf "\r%80s\r" ""
             echo "✅ All runs completed!"
             echo ""
-            echo "📊 Recent run results:"
+            echo "📊 Recent run results: (gh run list --limit 10)"
             gh run list --limit 10 --json databaseId,headBranch,name,status,conclusion --jq '.[] | "  #\(.databaseId) [\(.conclusion // .status)] \(.headBranch) - \(.name)"' 2>/dev/null
             break
         else
-            printf "\r⏳ Still running: %d in_progress, %d queued (checking every %ds)..." "$in_progress" "$queued" "$WATCH_INTERVAL"
+            printf "⏳ Still running: %d active (checking every %ds)...\r" "$in_progress" "$WATCH_INTERVAL"
             sleep "$WATCH_INTERVAL"
         fi
     done
@@ -106,39 +158,51 @@ cancel_runs_for_branch() {
 
 cancel_all_except_branch() {
     local except_branch="$1"
-    echo "🔍 Finding all in_progress/queued runs (excluding: $except_branch, last $LIMIT runs)"
+    echo "🔍 Finding all in_progress/queued runs (keeping only LATEST per workflow on: $except_branch)"
 
-    # Get all runs with branch info
-    local all_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch --jq '.[] | "\(.databaseId) \(.headBranch)"' 2>/dev/null)
-    all_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch --jq '.[] | "\(.databaseId) \(.headBranch)"' 2>/dev/null)
+    # Get all runs with branch, workflow name - sorted by run_id descending (highest first)
+    # Format: "run_id|branch|workflow_name"
+    local all_runs=$(gh run list --status in_progress --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
+    all_runs+=$'\n'$(gh run list --status queued --limit "$LIMIT" --json databaseId,headBranch,name --jq '.[] | "\(.databaseId)|\(.headBranch)|\(.name)"' 2>/dev/null)
 
-    all_runs=$(echo "$all_runs" | grep -v '^$' | sort -u)
+    all_runs=$(echo "$all_runs" | grep -v '^$' | sort -t'|' -k1 -rn | uniq)
 
     if [ -z "$all_runs" ]; then
         echo "✅ No active runs found"
         return 0
     fi
 
-    local canceled=0
-    local skipped=0
+    # Build list of latest run IDs per workflow on the excepted branch
+    # Since we sorted descending, the first occurrence of each workflow is the latest
+    local seen_workflows=""
+    local keep_ids=""
 
-    echo "$all_runs" | while read -r line; do
-        if [ -n "$line" ]; then
-            local run_id=$(echo "$line" | awk '{print $1}')
-            local branch=$(echo "$line" | awk '{print $2}')
+    while IFS='|' read -r run_id branch workflow; do
+        if [ "$branch" = "$except_branch" ]; then
+            if ! echo "$seen_workflows" | grep -qF "|${workflow}|"; then
+                seen_workflows="${seen_workflows}|${workflow}|"
+                keep_ids="${keep_ids}|${run_id}|"
+                echo "  📌 Keeping #$run_id (latest '$workflow' on $except_branch)"
+            fi
+        fi
+    done <<< "$all_runs"
 
-            if [ "$branch" = "$except_branch" ]; then
-                echo "  ⏭️  Skipping run #$run_id (branch: $branch)"
-                ((skipped++)) || true
+    # Now process all runs
+    while IFS='|' read -r run_id branch workflow; do
+        if [ -n "$run_id" ]; then
+            if echo "$keep_ids" | grep -qF "|${run_id}|"; then
+                echo "  ⏭️  Skipping run #$run_id (latest $workflow on $branch)"
+            elif [ "$branch" = "$except_branch" ]; then
+                echo "  ❌ Canceling run #$run_id (older $workflow on $branch)..."
+                gh run cancel "$run_id" 2>/dev/null || echo "    ⚠️  Could not cancel #$run_id"
             else
                 echo "  ❌ Canceling run #$run_id (branch: $branch)..."
                 gh run cancel "$run_id" 2>/dev/null || echo "    ⚠️  Could not cancel #$run_id"
-                ((canceled++)) || true
             fi
         fi
-    done
+    done <<< "$all_runs"
 
-    echo "✅ Done. Canceled runs, skipped runs on '$except_branch'"
+    echo "✅ Done. Kept only latest runs per workflow on '$except_branch', canceled all others"
 }
 
 # Parse arguments
