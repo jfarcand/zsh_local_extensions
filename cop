@@ -1,0 +1,27 @@
+#!/usr/bin/env zsh
+# Launcher for GitHub Copilot CLI with model selection
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: cop [--opus|--sonnet|--gemini|--gpt]"
+  echo ""
+  echo "  --opus     Claude Opus 4.6 (fast mode)"
+  echo "  --sonnet   Claude Sonnet 4.6 (default)"
+  echo "  --gemini   Gemini 3 Pro"
+  echo "  --gpt      GPT-5.3 Codex"
+  exit 1
+}
+
+model="claude-sonnet-4.6"
+
+case "${1:---sonnet}" in
+  --opus)    model="claude-opus-4.6-fast" ;;
+  --sonnet)  model="claude-sonnet-4.6" ;;
+  --gemini)  model="gemini-3-pro-preview" ;;
+  --gpt)     model="gpt-5.3-codex" ;;
+  --help|-h) usage ;;
+  *)         echo "Unknown option: $1"; usage ;;
+esac
+
+exec copilot --allow-all-tools --allow-all-paths --model="$model"
