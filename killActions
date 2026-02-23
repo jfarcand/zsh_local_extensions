@@ -93,11 +93,14 @@ watch_until_complete() {
                             local created=$(echo "$line" | jq -r '.createdAt')
                             local updated=$(echo "$line" | jq -r '.updatedAt')
                             # Calculate duration
-                            local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created%.*}Z" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
-                            local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${updated%.*}Z" "+%s" 2>/dev/null || date -d "$updated" "+%s" 2>/dev/null)
+                            local clean_created=$(echo "$created" | sed 's/\.[0-9]*Z$/Z/')
+                            local clean_updated=$(echo "$updated" | sed 's/\.[0-9]*Z$/Z/')
+                            local start_ts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$clean_created" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
+                            local end_ts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$clean_updated" "+%s" 2>/dev/null || date -d "$updated" "+%s" 2>/dev/null)
                             local duration_str=""
-                            if [ -n "$start_ts" ] && [ -n "$end_ts" ]; then
+                            if [ -n "$start_ts" ] && [ -n "$end_ts" ] && [ "$start_ts" -gt 0 ] && [ "$end_ts" -gt 0 ]; then
                                 local dur=$((end_ts - start_ts))
+                                [ "$dur" -lt 0 ] && dur=0
                                 if [ "$dur" -ge 3600 ]; then
                                     duration_str="$((dur / 3600))h$((dur % 3600 / 60))m"
                                 elif [ "$dur" -ge 60 ]; then
@@ -185,9 +188,12 @@ watch_until_complete() {
                 if [ -n "$run_id" ]; then
                     local elapsed_str=""
                     if [ -n "$created" ]; then
-                        local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created%.*}Z" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
-                        if [ -n "$start_ts" ]; then
+                        # Remove milliseconds if present: 2025-12-04T20:15:43.123Z → 2025-12-04T20:15:43Z
+                        local clean_ts=$(echo "$created" | sed 's/\.[0-9]*Z$/Z/')
+                        local start_ts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$clean_ts" "+%s" 2>/dev/null || date -d "$created" "+%s" 2>/dev/null)
+                        if [ -n "$start_ts" ] && [ "$start_ts" -gt 0 ]; then
                             local elapsed=$((now_ts - start_ts))
+                            [ "$elapsed" -lt 0 ] && elapsed=0
                             if [ "$elapsed" -ge 3600 ]; then
                                 elapsed_str="$((elapsed / 3600))h$((elapsed % 3600 / 60))m"
                             elif [ "$elapsed" -ge 60 ]; then
