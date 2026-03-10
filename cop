@@ -1,27 +1,60 @@
 #!/usr/bin/env zsh
-# Launcher for GitHub Copilot CLI with model selection
+# Launcher for GitHub Copilot CLI with model selection.
+# Dynamically resolves the latest available model version for each family.
 
 set -euo pipefail
 
+# Extract available models from copilot --help and return the latest
+# matching the given grep -E pattern, sorted by version.
+pick_latest() {
+  local pattern="$1"
+  copilot --help 2>&1 \
+    | sed -n '/--model/,/)/p' \
+    | grep -oE '"[^"]+"' \
+    | tr -d '"' \
+    | grep -E "^${pattern}" \
+    | sort -V \
+    | tail -1
+}
+
 usage() {
-  echo "Usage: cop [--opus|--sonnet|--gemini|--gpt]"
+  echo "Usage: cop [--opus|--sonnet|--gemini|--gpt] [copilot-options...]"
   echo ""
-  echo "  --opus     Claude Opus 4.6 (fast mode)"
-  echo "  --sonnet   Claude Sonnet 4.6 (default)"
-  echo "  --gemini   Gemini 3 Pro"
-  echo "  --gpt      GPT-5.3 Codex"
+  echo "Model shortcuts (picks latest available version):"
+  echo "  --opus     Claude Opus (fast mode)"
+  echo "  --sonnet   Claude Sonnet (default)"
+  echo "  --gemini   Gemini Pro"
+  echo "  --gpt      GPT"
+  echo ""
+  echo "All other options are passed through to copilot."
   exit 1
 }
 
-model="claude-sonnet-4.6"
+family="sonnet"
+passthrough=()
 
-case "${1:---sonnet}" in
-  --opus)    model="claude-opus-4.6-fast" ;;
-  --sonnet)  model="claude-sonnet-4.6" ;;
-  --gemini)  model="gemini-3-pro-preview" ;;
-  --gpt)     model="gpt-5.3-codex" ;;
-  --help|-h) usage ;;
-  *)         echo "Unknown option: $1"; usage ;;
+for arg in "$@"; do
+  case "$arg" in
+    --opus)    family="opus" ;;
+    --sonnet)  family="sonnet" ;;
+    --gemini)  family="gemini" ;;
+    --gpt)     family="gpt" ;;
+    --help|-h) usage ;;
+    *)         passthrough+=("$arg") ;;
+  esac
+done
+
+case "$family" in
+  opus)    model=$(pick_latest 'claude-opus-.*-fast') ;;
+  sonnet)  model=$(pick_latest 'claude-sonnet-') ;;
+  gemini)  model=$(pick_latest 'gemini-') ;;
+  gpt)     model=$(pick_latest 'gpt-') ;;
 esac
 
-exec copilot --allow-all-tools --allow-all-paths --model="$model"
+if [[ -z "$model" ]]; then
+  echo "Error: could not resolve a model for --${family}" >&2
+  exit 1
+fi
+
+echo "Using model: $model"
+exec copilot --allow-all-tools --allow-all-paths --model="$model" "${passthrough[@]}"
