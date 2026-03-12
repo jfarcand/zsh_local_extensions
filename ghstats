@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# ghstats - Track GitHub repo stars & forks with daily deltas
+#
+# Usage:
+#   ghstats                          # use default repos from config
+#   ghstats owner/repo [owner/repo]  # specify repos on command line
+#   ghstats -w [SECONDS]             # watch mode, refresh every N seconds (default 300)
+#   ghstats --watch 60 owner/repo    # watch a specific repo every 60s
+#
+# Config file: ~/.config/ghstats/repos.conf  (one owner/repo per line)
+# History:     ~/.config/ghstats/history.json
+
+set -euo pipefail
+
+# ── Parse flags ──────────────────────────────────────────────────
+WATCH=false
+WATCH_INTERVAL=300  # default 5 minutes
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)
+      WATCH=true
+      # If next arg is a number, use it as interval
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        WATCH_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,9p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+CONFIG_DIR="${HOME}/.config/ghstats"
+REPOS_CONF="${CONFIG_DIR}/repos.conf"
+HISTORY_FILE="${CONFIG_DIR}/history.json"
+TODAY=$(date +%Y-%m-%d)
+
+# ── Colors & symbols ────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+UP_ARROW="▲"
+DOWN_ARROW="▼"
+DASH="─"
+
+# ── Helpers ──────────────────────────────────────────────────────
+ensure_config_dir() {
+  mkdir -p "${CONFIG_DIR}"
+  [[ -f "${HISTORY_FILE}" ]] || echo '{}' > "${HISTORY_FILE}"
+}
+
+# Seed the default repos config if it doesn't exist
+seed_defaults() {
+  if [[ ! -f "${REPOS_CONF}" ]]; then
+    cat > "${REPOS_CONF}" <<'EOF'
+dravr-ai/dravr-embacle
+Atmosphere/atmosphere
+jfarcand/iphone-mirroir-mcp
+jfarcand/mirroir-skills
+EOF
+  fi
+}
+
+load_repos() {
+  if [[ $# -gt 0 ]]; then
+    # Repos from command line — strip full GitHub URLs to owner/repo
+    for arg in "$@"; do
+      echo "${arg}" | sed -E 's|https?://github\.com/||' | sed 's|/$||'
+    done
+  elif [[ -f "${REPOS_CONF}" ]]; then
+    grep -v '^\s*#' "${REPOS_CONF}" | grep -v '^\s*$' | \
+      sed -E 's|https?://github\.com/||' | sed 's|/$||'
+  else
+    echo "No repos specified. Pass them as arguments or add to ${REPOS_CONF}" >&2
+    exit 1
+  fi
+}
+
+fetch_repo() {
+  local repo="$1"
+  gh api "repos/${repo}" --jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}' 2>/dev/null
+}
+
+get_previous() {
+  local repo="$1"
+  local key
+  key=$(echo "${repo}" | tr '/' '_')
+  local entry
+  entry=$(jq -r --arg k "${key}" '.[$k] // empty' "${HISTORY_FILE}" 2>/dev/null)
+  if [[ -z "${entry}" || "${entry}" == "null" ]]; then
+    return
+  fi
+
+  local current_date
+  current_date=$(echo "${entry}" | jq -r '.current.date // empty' 2>/dev/null || true)
+
+  if [[ -z "${current_date}" || "${current_date}" == "null" ]]; then
+    # Old format (flat {stars, forks, watchers, date}): return as-is for comparison
+    local old_date
+    old_date=$(echo "${entry}" | jq -r '.date // empty' 2>/dev/null || true)
+    if [[ -n "${old_date}" && "${old_date}" != "null" ]]; then
+      echo "${entry}"
+    fi
+    return
+  fi
+
+  if [[ "${current_date}" == "${TODAY}" ]]; then
+    # Already ran today — compare against the saved previous snapshot
+    echo "${entry}" | jq -r '.previous // empty' 2>/dev/null || true
+  else
+    # First run today — compare against current (which is from a prior day)
+    echo "${entry}" | jq -r '.current // empty' 2>/dev/null || true
+  fi
+}
+
+save_today() {
+  local repo="$1" stars="$2" forks="$3" watchers="$4"
+  local key
+  key=$(echo "${repo}" | tr '/' '_')
+  local tmp
+  tmp=$(mktemp)
+
+  local current_date
+  current_date=$(jq -r --arg k "${key}" '.[$k].current.date // empty' "${HISTORY_FILE}" 2>/dev/null || true)
+
+  if [[ -z "${current_date}" || "${current_date}" == "null" ]]; then
+    # Check for old format and migrate
+    local old_date
+    old_date=$(jq -r --arg k "${key}" '.[$k].date // empty' "${HISTORY_FILE}" 2>/dev/null || true)
+    if [[ -n "${old_date}" && "${old_date}" != "null" && "${old_date}" != "${TODAY}" ]]; then
+      # Migrate: old flat entry becomes previous
+      jq --arg k "${key}" \
+         --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" \
+         --arg d "${TODAY}" \
+         '.[$k] = {previous: {stars: .[$k].stars, forks: .[$k].forks, watchers: .[$k].watchers, date: .[$k].date}, current: {stars: $s, forks: $f, watchers: $w, date: $d}}' \
+         "${HISTORY_FILE}" > "${tmp}" && mv "${tmp}" "${HISTORY_FILE}"
+    else
+      # No prior history or same-day old format — just create new entry
+      jq --arg k "${key}" \
+         --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" \
+         --arg d "${TODAY}" \
+         '.[$k] = {current: {stars: $s, forks: $f, watchers: $w, date: $d}}' \
+         "${HISTORY_FILE}" > "${tmp}" && mv "${tmp}" "${HISTORY_FILE}"
+    fi
+  elif [[ "${current_date}" != "${TODAY}" ]]; then
+    # New day: rotate current → previous, then save new current
+    jq --arg k "${key}" \
+       --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" \
+       --arg d "${TODAY}" \
+       '.[$k] = {previous: .[$k].current, current: {stars: $s, forks: $f, watchers: $w, date: $d}}' \
+       "${HISTORY_FILE}" > "${tmp}" && mv "${tmp}" "${HISTORY_FILE}"
+  else
+    # Same day: just update current, keep previous intact
+    jq --arg k "${key}" \
+       --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" \
+       --arg d "${TODAY}" \
+       '.[$k].current = {stars: $s, forks: $f, watchers: $w, date: $d}' \
+       "${HISTORY_FILE}" > "${tmp}" && mv "${tmp}" "${HISTORY_FILE}"
+  fi
+}
+
+format_delta() {
+  local current="$1" previous="$2"
+  if [[ -z "${previous}" || "${previous}" == "null" ]]; then
+    printf "${DIM}%-8s${RESET}" "new"
+    return
+  fi
+  local diff=$(( current - previous ))
+  if (( diff > 0 )); then
+    printf "${GREEN}%-8s${RESET}" "${UP_ARROW} +${diff}"
+  elif (( diff < 0 )); then
+    printf "${RED}%-8s${RESET}" "${DOWN_ARROW} ${diff}"
+  else
+    printf "${DIM}%-8s${RESET}" "──"
+  fi
+}
+
+print_separator() {
+  local w="$1"
+  printf "├"
+  for i in $(seq 1 $((w + 2))); do printf "─"; done
+  printf "┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤\n"
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+ensure_config_dir
+seed_defaults
+
+REPOS=()
+while IFS= read -r line; do
+  REPOS+=("${line}")
+done < <(load_repos "$@")
+
+if [[ ${#REPOS[@]} -eq 0 ]]; then
+  echo "No repos to track." >&2
+  exit 1
+fi
+
+# Find longest repo name for column sizing
+max_len=10
+for repo in "${REPOS[@]}"; do
+  (( ${#repo} > max_len )) && max_len=${#repo}
+done
+
+display_stats() {
+  local now
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+  local last_prev_date=""
+
+  # ── Header ─────────────────────────────────────────────────────
+  echo ""
+  if [[ "${WATCH}" == true ]]; then
+    printf "${BOLD}${CYAN}  GitHub Stats ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n"
+  else
+    printf "${BOLD}${CYAN}  GitHub Stats ${RESET}${DIM}(${now})${RESET}\n"
+  fi
+  echo ""
+
+  # Table header
+  printf "┌"
+  for i in $(seq 1 $((max_len + 2))); do printf "─"; done
+  printf "┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐\n"
+
+  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │\n" \
+    "Repository" "Stars" "Delta" "Forks" "Delta" "Watch" "Delta"
+
+  print_separator "${max_len}"
+
+  # ── Fetch & display ───────────────────────────────────────────
+  local errors=()
+  for repo in "${REPOS[@]}"; do
+    local data
+    data=$(fetch_repo "${repo}" 2>/dev/null || true)
+
+    if [[ -z "${data}" ]]; then
+      errors+=("${repo}")
+      printf "│ ${RED}%-${max_len}s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │\n" \
+        "${repo}" "err" "--" "err" "--" "err" "--"
+      continue
+    fi
+
+    local stars forks watchers prev prev_stars prev_forks prev_watchers prev_date
+    local stars_delta forks_delta watchers_delta
+    stars=$(echo "${data}" | jq -r '.stars')
+    forks=$(echo "${data}" | jq -r '.forks')
+    watchers=$(echo "${data}" | jq -r '.watchers')
+
+    prev=$(get_previous "${repo}")
+    prev_stars=$(echo "${prev}" | jq -r '.stars // empty' 2>/dev/null || true)
+    prev_forks=$(echo "${prev}" | jq -r '.forks // empty' 2>/dev/null || true)
+    prev_watchers=$(echo "${prev}" | jq -r '.watchers // empty' 2>/dev/null || true)
+    prev_date=$(echo "${prev}" | jq -r '.date // empty' 2>/dev/null || true)
+    [[ -n "${prev_date}" && "${prev_date}" != "null" ]] && last_prev_date="${prev_date}"
+
+    stars_delta=$(format_delta "${stars}" "${prev_stars}")
+    forks_delta=$(format_delta "${forks}" "${prev_forks}")
+    watchers_delta=$(format_delta "${watchers}" "${prev_watchers}")
+
+    printf "│ %-${max_len}s │ %8s │ " "${repo}" "${stars}"
+    printf "${stars_delta}"
+    printf " │ %8s │ " "${forks}"
+    printf "${forks_delta}"
+    printf " │ %8s │ " "${watchers}"
+    printf "${watchers_delta}"
+    printf " │\n"
+
+    save_today "${repo}" "${stars}" "${forks}" "${watchers}"
+  done
+
+  # Table footer
+  printf "└"
+  for i in $(seq 1 $((max_len + 2))); do printf "─"; done
+  printf "┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘\n"
+
+  if [[ -n "${last_prev_date}" ]]; then
+    printf "\n${DIM}  Δ compared to: ${last_prev_date}${RESET}\n"
+  else
+    printf "\n${DIM}  First run — deltas will appear on next run.${RESET}\n"
+  fi
+
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    printf "\n${YELLOW}  ⚠ Could not fetch: %s${RESET}\n" "${errors[*]}"
+  fi
+
+  echo ""
+}
+
+# ── Run (once or watch) ─────────────────────────────────────────
+if [[ "${WATCH}" == true ]]; then
+  trap 'printf "\033[?25h\n${DIM}  Stopped.${RESET}\n" > /dev/tty; exit 0' INT
+  printf '\033[?25l' > /dev/tty
+  while true; do
+    printf '\033[H\033[2J\033[3J' > /dev/tty
+    display_stats > /dev/tty 2>&1
+    sleep "${WATCH_INTERVAL}"
+  done
+else
+  display_stats
+fi
