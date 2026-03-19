@@ -1,30 +1,25 @@
 #!/usr/bin/env zsh
 # Launcher for GitHub Copilot CLI with model selection.
-# Dynamically resolves the latest available model version for each family.
+# Uses a static model mapping (copilot no longer lists models in --help).
 
 set -euo pipefail
 
-# Extract available models from copilot --help and return the latest
-# matching the given grep -E pattern, sorted by version.
-pick_latest() {
-  local pattern="$1"
-  copilot --help 2>&1 \
-    | sed -n '/--model/,/)/p' \
-    | grep -oE '"[^"]+"' \
-    | tr -d '"' \
-    | grep -E "^${pattern}" \
-    | sort -V \
-    | tail -1
-}
+# Model mapping — update these when copilot adds new models.
+# Run `copilot` interactively to see the current model list.
+typeset -A models=(
+  [opus]="claude-opus-4.6-fast"
+  [sonnet]="claude-sonnet-4"
+  [gemini]="gemini-3-pro"
+  [gpt]="gpt-5.4"
+)
 
 usage() {
   echo "Usage: cop [--opus|--sonnet|--gemini|--gpt] [copilot-options...]"
   echo ""
-  echo "Model shortcuts (picks latest available version):"
-  echo "  --opus     Claude Opus (fast mode)"
-  echo "  --sonnet   Claude Sonnet (default)"
-  echo "  --gemini   Gemini Pro"
-  echo "  --gpt      GPT"
+  echo "Model shortcuts:"
+  for key in ${(k)models}; do
+    printf "  --%-8s %s\n" "$key" "${models[$key]}"
+  done
   echo ""
   echo "All other options are passed through to copilot."
   exit 1
@@ -44,17 +39,7 @@ for arg in "$@"; do
   esac
 done
 
-case "$family" in
-  opus)    model=$(pick_latest 'claude-opus-.*-fast') ;;
-  sonnet)  model=$(pick_latest 'claude-sonnet-') ;;
-  gemini)  model=$(pick_latest 'gemini-') ;;
-  gpt)     model=$(pick_latest 'gpt-') ;;
-esac
-
-if [[ -z "$model" ]]; then
-  echo "Error: could not resolve a model for --${family}" >&2
-  exit 1
-fi
+model="${models[$family]}"
 
 echo "Using model: $model"
 exec copilot --allow-all-tools --allow-all-paths --model="$model" "${passthrough[@]}"

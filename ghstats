@@ -93,11 +93,17 @@ load_repos() {
 
 fetch_repo() {
   local repo="$1"
-  local repo_data issues_count prs_count
+  local repo_data issues_count prs_count views_count clones_count
   repo_data=$(gh api "repos/${repo}" --jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}' 2>/dev/null) || return 1
   issues_count=$(gh api "search/issues?q=repo:${repo}+type:issue+state:open" --jq '.total_count' 2>/dev/null) || issues_count=0
   prs_count=$(gh api "search/issues?q=repo:${repo}+type:pr+state:open" --jq '.total_count' 2>/dev/null) || prs_count=0
-  echo "${repo_data}" | jq --argjson i "${issues_count}" --argjson p "${prs_count}" '. + {issues: $i, prs: $p}'
+  # Traffic requires push access — gracefully degrade
+  views_count=$(gh api "repos/${repo}/traffic/views" --jq '.count' 2>/dev/null) || views_count=null
+  clones_count=$(gh api "repos/${repo}/traffic/clones" --jq '.count' 2>/dev/null) || clones_count=null
+  echo "${repo_data}" | jq \
+    --argjson i "${issues_count}" --argjson p "${prs_count}" \
+    --argjson v "${views_count}" --argjson c "${clones_count}" \
+    '. + {issues: $i, prs: $p, views: $v, clones: $c}'
 }
 
 get_previous() {
@@ -133,7 +139,7 @@ get_previous() {
 }
 
 save_today() {
-  local repo="$1" stars="$2" forks="$3" watchers="$4" issues="$5" prs="$6"
+  local repo="$1" stars="$2" forks="$3" watchers="$4" issues="$5" prs="$6" views="$7" clones="$8"
   local key
   key=$(echo "${repo}" | tr '/' '_')
   local tmp
@@ -142,8 +148,8 @@ save_today() {
   local current_date
   current_date=$(jq -r --arg k "${key}" '.[$k].current.date // empty' "${HISTORY_FILE}" 2>/dev/null || true)
 
-  local jq_current='{stars: $s, forks: $f, watchers: $w, issues: $i, prs: $p, date: $d}'
-  local jq_args=(--arg k "${key}" --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" --argjson i "${issues}" --argjson p "${prs}" --arg d "${TODAY}")
+  local jq_current='{stars: $s, forks: $f, watchers: $w, issues: $i, prs: $p, views: $v, clones: $c, date: $d}'
+  local jq_args=(--arg k "${key}" --argjson s "${stars}" --argjson f "${forks}" --argjson w "${watchers}" --argjson i "${issues}" --argjson p "${prs}" --argjson v "${views}" --argjson c "${clones}" --arg d "${TODAY}")
 
   if [[ -z "${current_date}" || "${current_date}" == "null" ]]; then
     # Check for old format and migrate
@@ -193,7 +199,8 @@ print_separator() {
   local w="$1"
   printf "├"
   for i in $(seq 1 $((w + 2))); do printf "─"; done
-  printf "┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┼${COL}┤\n"
+  local sep_cols="" ; for i in $(seq 1 14); do sep_cols+="┼${COL}"; done
+  printf "${sep_cols}┤\n"
 }
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -233,10 +240,11 @@ display_stats() {
   # Table header
   printf "┌"
   for i in $(seq 1 $((max_len + 2))); do printf "─"; done
-  printf "┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┬${COL}┐\n"
+  local hdr_cols="" ; for i in $(seq 1 14); do hdr_cols+="┬${COL}"; done
+  printf "${hdr_cols}┐\n"
 
-  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │\n" \
-    "Repository" "Stars" "Delta" "Forks" "Delta" "Watch" "Delta" "Issues" "Delta" "PRs" "Delta"
+  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │\n" \
+    "Repository" "Stars" "Delta" "Forks" "Delta" "Watch" "Delta" "Issues" "Delta" "PRs" "Delta" "Views" "Delta" "Clones" "Delta"
 
   print_separator "${max_len}"
 
@@ -248,18 +256,21 @@ display_stats() {
 
     if [[ -z "${data}" ]]; then
       errors+=("${repo}")
-      printf "│ ${RED}%-${max_len}s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │\n" \
-        "${repo}" "err" "--" "err" "--" "err" "--" "err" "--" "err" "--"
+      printf "│ ${RED}%-${max_len}s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │ ${DIM}%8s${RESET} │ ${DIM}%-8s${RESET} │\n" \
+        "${repo}" "err" "--" "err" "--" "err" "--" "err" "--" "err" "--" "err" "--" "err" "--"
       continue
     fi
 
-    local stars forks watchers issues prs prev prev_stars prev_forks prev_watchers prev_issues prev_prs prev_date
-    local stars_delta forks_delta watchers_delta issues_delta prs_delta
+    local stars forks watchers issues prs views clones
+    local prev prev_stars prev_forks prev_watchers prev_issues prev_prs prev_views prev_clones prev_date
+    local stars_delta forks_delta watchers_delta issues_delta prs_delta views_delta clones_delta
     stars=$(echo "${data}" | jq -r '.stars')
     forks=$(echo "${data}" | jq -r '.forks')
     watchers=$(echo "${data}" | jq -r '.watchers')
     issues=$(echo "${data}" | jq -r '.issues')
     prs=$(echo "${data}" | jq -r '.prs')
+    views=$(echo "${data}" | jq -r '.views')
+    clones=$(echo "${data}" | jq -r '.clones')
 
     prev=$(get_previous "${repo}")
     prev_stars=$(echo "${prev}" | jq -r '.stars // empty' 2>/dev/null || true)
@@ -267,6 +278,8 @@ display_stats() {
     prev_watchers=$(echo "${prev}" | jq -r '.watchers // empty' 2>/dev/null || true)
     prev_issues=$(echo "${prev}" | jq -r '.issues // empty' 2>/dev/null || true)
     prev_prs=$(echo "${prev}" | jq -r '.prs // empty' 2>/dev/null || true)
+    prev_views=$(echo "${prev}" | jq -r '.views // empty' 2>/dev/null || true)
+    prev_clones=$(echo "${prev}" | jq -r '.clones // empty' 2>/dev/null || true)
     prev_date=$(echo "${prev}" | jq -r '.date // empty' 2>/dev/null || true)
     [[ -n "${prev_date}" && "${prev_date}" != "null" ]] && last_prev_date="${prev_date}"
 
@@ -275,6 +288,13 @@ display_stats() {
     watchers_delta=$(format_delta "${watchers}" "${prev_watchers}")
     issues_delta=$(format_delta "${issues}" "${prev_issues}")
     prs_delta=$(format_delta "${prs}" "${prev_prs}")
+    views_delta=$(format_delta "${views}" "${prev_views}")
+    clones_delta=$(format_delta "${clones}" "${prev_clones}")
+
+    # Format views/clones: show "--" if no push access (null)
+    local views_display clones_display
+    if [[ "${views}" == "null" ]]; then views_display="--"; else views_display="${views}"; fi
+    if [[ "${clones}" == "null" ]]; then clones_display="--"; else clones_display="${clones}"; fi
 
     printf "│ %-${max_len}s │ %8s │ " "${repo}" "${stars}"
     printf "${stars_delta}"
@@ -286,15 +306,20 @@ display_stats() {
     printf "${issues_delta}"
     printf " │ %8s │ " "${prs}"
     printf "${prs_delta}"
+    printf " │ %8s │ " "${views_display}"
+    printf "${views_delta}"
+    printf " │ %8s │ " "${clones_display}"
+    printf "${clones_delta}"
     printf " │\n"
 
-    save_today "${repo}" "${stars}" "${forks}" "${watchers}" "${issues}" "${prs}"
+    save_today "${repo}" "${stars}" "${forks}" "${watchers}" "${issues}" "${prs}" "${views}" "${clones}"
   done
 
   # Table footer
   printf "└"
   for i in $(seq 1 $((max_len + 2))); do printf "─"; done
-  printf "┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┴${COL}┘\n"
+  local ftr_cols="" ; for i in $(seq 1 14); do ftr_cols+="┴${COL}"; done
+  printf "${ftr_cols}┘\n"
 
   if [[ -n "${last_prev_date}" ]]; then
     printf "\n${DIM}  Δ compared to: ${last_prev_date}${RESET}\n"
