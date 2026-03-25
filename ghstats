@@ -43,7 +43,7 @@ set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
 CONFIG_DIR="${HOME}/.config/ghstats"
 REPOS_CONF="${CONFIG_DIR}/repos.conf"
 HISTORY_FILE="${CONFIG_DIR}/history.json"
-TODAY=$(date +%Y-%m-%d)
+TODAY=$(date -u +%Y-%m-%d)
 
 # ── Colors & symbols ────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -93,13 +93,15 @@ load_repos() {
 
 fetch_repo() {
   local repo="$1"
-  local repo_data issues_count prs_count views_count clones_count
-  repo_data=$(gh api "repos/${repo}" --jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}' 2>/dev/null) || return 1
-  issues_count=$(gh api "search/issues?q=repo:${repo}+type:issue+state:open" --jq '.total_count' 2>/dev/null) || issues_count=0
-  prs_count=$(gh api "search/issues?q=repo:${repo}+type:pr+state:open" --jq '.total_count' 2>/dev/null) || prs_count=0
+  local canonical_repo repo_data issues_count prs_count views_count clones_count
+  # Resolve canonical name (handles renames/redirects)
+  canonical_repo=$(gh api "repos/${repo}" --jq '.full_name' 2>/dev/null) || return 1
+  repo_data=$(gh api "repos/${canonical_repo}" --jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}' 2>/dev/null) || return 1
+  issues_count=$(gh api "search/issues?q=repo:${canonical_repo}+type:issue+state:open" --jq '.total_count' 2>/dev/null) || issues_count=0
+  prs_count=$(gh api "search/issues?q=repo:${canonical_repo}+type:pr+state:open" --jq '.total_count' 2>/dev/null) || prs_count=0
   # Traffic requires push access — gracefully degrade
-  views_count=$(gh api "repos/${repo}/traffic/views" --jq '.count' 2>/dev/null) || views_count=null
-  clones_count=$(gh api "repos/${repo}/traffic/clones" --jq '.count' 2>/dev/null) || clones_count=null
+  views_count=$(gh api "repos/${canonical_repo}/traffic/views" --jq '.count' 2>/dev/null) || views_count=null
+  clones_count=$(gh api "repos/${canonical_repo}/traffic/clones" --jq '.count' 2>/dev/null) || clones_count=null
   echo "${repo_data}" | jq \
     --argjson i "${issues_count}" --argjson p "${prs_count}" \
     --argjson v "${views_count}" --argjson c "${clones_count}" \
@@ -224,6 +226,8 @@ for repo in "${REPOS[@]}"; do
 done
 
 display_stats() {
+  # Refresh date (UTC) so watch mode rotates history at 00:00 UTC
+  TODAY=$(date -u +%Y-%m-%d)
   local now
   now=$(date '+%Y-%m-%d %H:%M:%S')
   local last_prev_date=""

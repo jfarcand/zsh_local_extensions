@@ -10,7 +10,7 @@ typeset -A models=(
   [opus]="claude-opus-4.6-fast"
   [sonnet]="claude-sonnet-4"
   [gemini]="gemini-3-pro"
-  [gpt]="gpt-5.4"
+  [gpt]="gpt-5.3-codex"
 )
 
 usage() {
