@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# ghactions - Watch GitHub Actions workflow runs
+#
+# Usage:
+#   ghactions                                  # current repo, main branch
+#   ghactions --branch feature-x               # specific branch
+#   ghactions -R owner/repo                    # specific repo
+#   ghactions -R repo1 -R repo2                # multiple repos
+#   ghactions owner/repo1 owner/repo2          # multiple repos (positional)
+#   ghactions -w [SECONDS]                     # watch mode (default 300s)
+#
+# Config file: ~/.config/ghactions/repos.conf  (one owner/repo per line)
+# Sends a desktop notification (with sound) when a workflow turns red.
+
+set -euo pipefail
+
+# ── Parse flags ──────────────────────────────────────────────────
+WATCH=false
+WATCH_INTERVAL=300
+BRANCH="main"
+REPOS=()
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)
+      WATCH=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        WATCH_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    -b|--branch)
+      BRANCH="${2:?--branch requires a value}"
+      shift 2
+      ;;
+    -R|--repo)
+      REPOS+=("${2:?--repo requires a value}")
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,12p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+# Positional args are also repos
+for arg in "$@"; do
+  REPOS+=("$arg")
+done
+
+CONFIG_DIR="${HOME}/.config/ghactions"
+STATE_FILE="${CONFIG_DIR}/state.json"
+REPOS_CONF="${CONFIG_DIR}/repos.conf"
+mkdir -p "${CONFIG_DIR}"
+[[ -f "${STATE_FILE}" ]] || echo '{}' > "${STATE_FILE}"
+
+# If no repos from flags/args, try config file, then current git repo
+if [[ ${#REPOS[@]} -eq 0 ]]; then
+  if [[ -f "${REPOS_CONF}" ]]; then
+    while IFS= read -r line; do
+      [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+      REPOS+=("${line}")
+    done < "${REPOS_CONF}"
+  else
+    # Fall back to current directory's git remote
+    local_repo=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]||;s|\.git$||' || true)
+    if [[ -n "${local_repo}" ]]; then
+      REPOS+=("${local_repo}")
+    else
+      echo "No repos specified. Pass -R owner/repo, positional args, or add to ${REPOS_CONF}" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# ── Colors & symbols ────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Column widths ────────────────────────────────────────────────
+W_STATUS=10
+W_STARTED=19
+W_FINISHED=19
+W_DURATION=10
+W_FAILSINCE=12
+
+# ── Helpers ──────────────────────────────────────────────────────
+notify_failure() {
+  local workflow="$1" repo_display="$2"
+  osascript -e "display notification \"${workflow} is now failing on ${BRANCH}\" with title \"GitHub Actions: ${repo_display}\" sound name \"Sosumi\"" 2>/dev/null || true
+}
+
+format_duration() {
+  local seconds="$1"
+  if (( seconds < 60 )); then
+    echo "${seconds}s"
+  elif (( seconds < 3600 )); then
+    printf "%dm %ds" $(( seconds / 60 )) $(( seconds % 60 ))
+  else
+    printf "%dh %dm" $(( seconds / 3600 )) $(( (seconds % 3600) / 60 ))
+  fi
+}
+
+parse_epoch() {
+  local ts="$1"
+  [[ -z "${ts}" || "${ts}" == "null" ]] && { echo 0; return; }
+  date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%s" 2>/dev/null || echo 0
+}
+
+parse_time() {
+  local ts="$1"
+  [[ -z "${ts}" || "${ts}" == "null" ]] && { echo "--"; return; }
+  date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:0:19}"
+}
+
+find_failing_since() {
+  local repo="$1" workflow_name="$2"
+  local repo_flag=()
+  [[ -n "${repo}" ]] && repo_flag=(--repo "${repo}")
+
+  local runs
+  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
+    --workflow "${workflow_name}" --branch "${BRANCH}" --limit 20 \
+    --json conclusion,headSha 2>/dev/null) || return
+
+  # Walk newest to oldest, find the oldest consecutive failure
+  local failing_sha="" count
+  count=$(echo "${runs}" | jq 'length')
+  for (( i=0; i<count; i++ )); do
+    local c
+    c=$(echo "${runs}" | jq -r ".[$i].conclusion")
+    if [[ "${c}" == "failure" ]]; then
+      failing_sha=$(echo "${runs}" | jq -r ".[$i].headSha")
+    else
+      break
+    fi
+  done
+  echo "${failing_sha}"
+}
+
+draw_border() {
+  local max_len="$1" left="$2" mid="$3" right="$4"
+  printf "%s" "${left}"
+  printf '%*s' $((max_len + 2)) '' | tr ' ' '─'
+  for w in ${W_STATUS} ${W_STARTED} ${W_FINISHED} ${W_DURATION} ${W_FAILSINCE}; do
+    printf "%s" "${mid}"
+    printf '%*s' $((w + 2)) '' | tr ' ' '─'
+  done
+  printf "%s\n" "${right}"
+}
+
+# ── Display for a single repo ───────────────────────────────────
+display_repo() {
+  local repo="$1" now="$2"
+  local repo_flag=()
+  [[ -n "${repo}" ]] && repo_flag=(--repo "${repo}")
+
+  local state_key
+  state_key=$(echo "${repo}" | tr '/' '_')
+
+  # Fetch latest runs for the branch
+  local runs
+  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
+    --branch "${BRANCH}" --limit 100 \
+    --json workflowName,status,conclusion,startedAt,updatedAt,headSha 2>/dev/null) || {
+    printf "  ${RED}Failed to fetch runs for ${repo}${RESET}\n\n"
+    return
+  }
+
+  # Latest run per workflow
+  local workflows
+  workflows=$(echo "${runs}" | jq '
+    group_by(.workflowName)
+    | map(sort_by(.startedAt) | reverse | .[0])
+    | sort_by(.workflowName)
+  ')
+
+  local count
+  count=$(echo "${workflows}" | jq 'length')
+
+  if (( count == 0 )); then
+    printf "  ${DIM}No workflow runs found for ${repo} (${BRANCH})${RESET}\n\n"
+    return
+  fi
+
+  # Longest workflow name for column sizing
+  local max_len=8
+  for (( i=0; i<count; i++ )); do
+    local name
+    name=$(echo "${workflows}" | jq -r ".[$i].workflowName")
+    (( ${#name} > max_len )) && max_len=${#name}
+  done
+
+  # ── Repo header ──
+  printf "  ${BOLD}${CYAN}${repo}${RESET} ${DIM}(${BRANCH})${RESET}\n\n"
+
+  draw_border "${max_len}" "┌" "┬" "┐"
+
+  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%-${W_STATUS}s${RESET} │ ${BOLD}%-${W_STARTED}s${RESET} │ ${BOLD}%-${W_FINISHED}s${RESET} │ ${BOLD}%-${W_DURATION}s${RESET} │ ${BOLD}%-${W_FAILSINCE}s${RESET} │\n" \
+    "Workflow" "Status" "Started" "Finished" "Duration" "Fail Since"
+
+  draw_border "${max_len}" "├" "┼" "┤"
+
+  # Load previous state for green→red detection
+  local prev_state new_state="{}"
+  prev_state=$(jq -r --arg k "${state_key}" '.[$k] // {}' "${STATE_FILE}" 2>/dev/null || echo '{}')
+
+  for (( i=0; i<count; i++ )); do
+    local name status conclusion started_at updated_at
+    name=$(echo "${workflows}" | jq -r ".[$i].workflowName")
+    status=$(echo "${workflows}" | jq -r ".[$i].status")
+    conclusion=$(echo "${workflows}" | jq -r ".[$i].conclusion")
+    started_at=$(echo "${workflows}" | jq -r ".[$i].startedAt")
+    updated_at=$(echo "${workflows}" | jq -r ".[$i].updatedAt")
+
+    # Time
+    local started_display finished_display duration_str
+    started_display=$(parse_time "${started_at}")
+    if [[ "${status}" == "completed" ]]; then
+      finished_display=$(parse_time "${updated_at}")
+      local s_epoch f_epoch
+      s_epoch=$(parse_epoch "${started_at}")
+      f_epoch=$(parse_epoch "${updated_at}")
+      duration_str=$(format_duration $(( f_epoch - s_epoch )))
+    else
+      finished_display="--"
+      duration_str="running"
+    fi
+
+    # Status with color
+    local status_display
+    case "${status}:${conclusion}" in
+      in_progress:*) status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "running")   ;;
+      queued:*)      status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "queued")       ;;
+      *:success)     status_display=$(printf "${GREEN}%-${W_STATUS}s${RESET}" "pass")       ;;
+      *:failure)     status_display=$(printf "${RED}%-${W_STATUS}s${RESET}" "FAIL")         ;;
+      *:cancelled)   status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "cancelled")    ;;
+      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${conclusion}") ;;
+    esac
+
+    # Failing since commit
+    local fail_display
+    if [[ "${conclusion}" == "failure" ]]; then
+      local fail_sha
+      fail_sha=$(find_failing_since "${repo}" "${name}")
+      if [[ -n "${fail_sha}" ]]; then
+        fail_display=$(printf "${RED}%-${W_FAILSINCE}s${RESET}" "${fail_sha:0:7}")
+      else
+        fail_display=$(printf "${DIM}%-${W_FAILSINCE}s${RESET}" "--")
+      fi
+    else
+      fail_display=$(printf "${DIM}%-${W_FAILSINCE}s${RESET}" "--")
+    fi
+
+    # Green → Red detection & notification
+    local wf_key prev_conclusion
+    wf_key=$(echo "${name}" | tr ' ' '_')
+    prev_conclusion=$(echo "${prev_state}" | jq -r --arg k "${wf_key}" '.[$k] // empty' 2>/dev/null || true)
+    if [[ "${conclusion}" == "failure" && "${prev_conclusion}" == "success" ]]; then
+      notify_failure "${name}" "${repo}"
+    fi
+    new_state=$(echo "${new_state}" | jq --arg k "${wf_key}" --arg v "${conclusion}" '.[$k] = $v')
+
+    # Print row
+    printf "│ %-${max_len}s │ %s │ %-${W_STARTED}s │ %-${W_FINISHED}s │ %-${W_DURATION}s │ %s │\n" \
+      "${name}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${fail_display}"
+  done
+
+  draw_border "${max_len}" "└" "┴" "┘"
+  echo ""
+
+  # Persist state
+  local tmp
+  tmp=$(mktemp)
+  jq --arg k "${state_key}" --argjson v "${new_state}" '.[$k] = $v' "${STATE_FILE}" > "${tmp}" && mv "${tmp}" "${STATE_FILE}"
+}
+
+# ── Main display (all repos) ────────────────────────────────────
+display_all() {
+  local now
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+
+  echo ""
+  if [[ "${WATCH}" == true ]]; then
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n"
+  else
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})${RESET}\n"
+  fi
+  echo ""
+
+  for repo in "${REPOS[@]}"; do
+    display_repo "${repo}" "${now}"
+  done
+}
+
+# ── Run (once or watch) ─────────────────────────────────────────
+if [[ "${WATCH}" == true ]]; then
+  trap 'printf "\033[?25h\n${DIM}  Stopped.${RESET}\n"; exit 0' INT
+  printf '\033[?25l'
+  while true; do
+    printf '\033[H\033[2J\033[3J' > /dev/tty
+    display_all
+    sleep "${WATCH_INTERVAL}"
+  done
+else
+  display_all
+fi
