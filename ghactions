@@ -92,15 +92,24 @@ RESET='\033[0m'
 
 # ── Column widths ────────────────────────────────────────────────
 W_STATUS=10
-W_STARTED=19
-W_FINISHED=19
+W_STARTED=14
+W_FINISHED=14
 W_DURATION=10
 W_FAILSINCE=12
 
 # ── Helpers ──────────────────────────────────────────────────────
 notify_failure() {
   local workflow="$1" repo_display="$2"
-  osascript -e "display notification \"${workflow} is now failing on ${BRANCH}\" with title \"GitHub Actions: ${repo_display}\" sound name \"Sosumi\"" 2>/dev/null || true
+  osascript -e "display notification \"${workflow} is now failing on ${BRANCH}\" with title \"GitHub Actions: ${repo_display}\" sound name \"Frog\"" 2>/dev/null || true
+  printf '\a'
+  afplay /System/Library/Sounds/Frog.aiff 2>/dev/null &
+}
+
+notify_recovery() {
+  local workflow="$1" repo_display="$2"
+  osascript -e "display notification \"${workflow} is green again on ${BRANCH}\" with title \"GitHub Actions: ${repo_display}\" sound name \"Hero\"" 2>/dev/null || true
+  printf '\a'
+  afplay /System/Library/Sounds/Hero.aiff 2>/dev/null &
 }
 
 format_duration() {
@@ -117,13 +126,16 @@ format_duration() {
 parse_epoch() {
   local ts="$1"
   [[ -z "${ts}" || "${ts}" == "null" ]] && { echo 0; return; }
-  date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%s" 2>/dev/null || echo 0
+  TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%s" 2>/dev/null || echo 0
 }
 
 parse_time() {
   local ts="$1"
   [[ -z "${ts}" || "${ts}" == "null" ]] && { echo "--"; return; }
-  date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:0:19}"
+  # Convert UTC timestamp to local time, show as MM-DD HH:MM:SS
+  local epoch
+  epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" "+%s" 2>/dev/null) || { echo "${ts:5:14}"; return; }
+  date -j -f "%s" "${epoch}" "+%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:5:14}"
 }
 
 find_failing_since() {
@@ -220,11 +232,11 @@ display_repo() {
 
   for (( i=0; i<count; i++ )); do
     local name status conclusion started_at updated_at
-    name=$(echo "${workflows}" | jq -r ".[$i].workflowName")
-    status=$(echo "${workflows}" | jq -r ".[$i].status")
-    conclusion=$(echo "${workflows}" | jq -r ".[$i].conclusion")
-    started_at=$(echo "${workflows}" | jq -r ".[$i].startedAt")
-    updated_at=$(echo "${workflows}" | jq -r ".[$i].updatedAt")
+    name=$(echo "${workflows}" | jq -r ".[$i].workflowName" 2>/dev/null || echo "unknown")
+    status=$(echo "${workflows}" | jq -r ".[$i].status" 2>/dev/null || echo "unknown")
+    conclusion=$(echo "${workflows}" | jq -r ".[$i].conclusion" 2>/dev/null || echo "unknown")
+    started_at=$(echo "${workflows}" | jq -r ".[$i].startedAt" 2>/dev/null || echo "null")
+    updated_at=$(echo "${workflows}" | jq -r ".[$i].updatedAt" 2>/dev/null || echo "null")
 
     # Time
     local started_display finished_display duration_str
@@ -234,7 +246,11 @@ display_repo() {
       local s_epoch f_epoch
       s_epoch=$(parse_epoch "${started_at}")
       f_epoch=$(parse_epoch "${updated_at}")
-      duration_str=$(format_duration $(( f_epoch - s_epoch )))
+      if (( s_epoch > 0 && f_epoch > 0 )); then
+        duration_str=$(format_duration $(( f_epoch - s_epoch )))
+      else
+        duration_str="--"
+      fi
     else
       finished_display="--"
       duration_str="running"
@@ -265,12 +281,14 @@ display_repo() {
       fail_display=$(printf "${DIM}%-${W_FAILSINCE}s${RESET}" "--")
     fi
 
-    # Green → Red detection & notification
+    # State transition detection & notification
     local wf_key prev_conclusion
     wf_key=$(echo "${name}" | tr ' ' '_')
     prev_conclusion=$(echo "${prev_state}" | jq -r --arg k "${wf_key}" '.[$k] // empty' 2>/dev/null || true)
     if [[ "${conclusion}" == "failure" && "${prev_conclusion}" == "success" ]]; then
       notify_failure "${name}" "${repo}"
+    elif [[ "${conclusion}" == "success" && "${prev_conclusion}" == "failure" ]]; then
+      notify_recovery "${name}" "${repo}"
     fi
     new_state=$(echo "${new_state}" | jq --arg k "${wf_key}" --arg v "${conclusion}" '.[$k] = $v')
 
@@ -302,7 +320,7 @@ display_all() {
   echo ""
 
   for repo in "${REPOS[@]}"; do
-    display_repo "${repo}" "${now}"
+    display_repo "${repo}" "${now}" || printf "  ${RED}Error fetching ${repo}${RESET}\n\n"
   done
 }
 

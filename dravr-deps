@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# dravr-deps — Show who depends on each dravr-* crate on crates.io
+set -euo pipefail
+
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# Fetch all dravr crates
+crates=$(curl -s "https://crates.io/api/v1/crates?q=dravr&per_page=50" | jq -r '.crates[].id')
+
+printf "\n${BOLD}${CYAN}  dravr crate dependencies${RESET}\n\n"
+
+for crate in ${crates}; do
+  deps=$(curl -s "https://crates.io/api/v1/crates/${crate}/reverse_dependencies" 2>/dev/null)
+  count=$(echo "${deps}" | jq '.meta.total // 0')
+  dep_names=$(echo "${deps}" | jq -r '.dependencies[].crate_id // empty' 2>/dev/null)
+
+  if (( count > 0 )); then
+    printf "  ${BOLD}%-30s${RESET} ${GREEN}%d dependent(s)${RESET}\n" "${crate}" "${count}"
+    for dep in ${dep_names}; do
+      printf "    - %s\n" "${dep}"
+    done
+  else
+    printf "  ${DIM}%-30s no dependents${RESET}\n" "${crate}"
+  fi
+done
+
+echo ""

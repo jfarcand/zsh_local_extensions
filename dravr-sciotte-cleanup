@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# dravr-sciotte-cleanup — Yank all crate versions, archive homebrew tap, delete GHCR images
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+ORG="dravr-ai"
+CRATES=(dravr-sciotte dravr-sciotte-mcp dravr-sciotte-server)
+VERSIONS=(0.1.0 0.2.0 0.2.1 0.3.0 0.3.1 0.3.2 0.4.0 0.4.1 0.4.3)
+
+printf "\n${BOLD}${CYAN}  dravr-sciotte cleanup${RESET}\n\n"
+printf "${DIM}  This will:${RESET}\n"
+printf "    1. Yank all crate versions from crates.io\n"
+printf "    2. Archive ${ORG}/homebrew-tap on GitHub\n"
+printf "    3. Delete all dravr-sciotte container images from ghcr.io\n\n"
+read -p "  Continue? [y/N] " -n 1 -r
+echo
+[[ "${REPLY}" =~ ^[Yy]$ ]] || { echo "  Aborted."; exit 0; }
+
+# ── 1. Yank crates ──────────────────────────────────────────────
+printf "\n${BOLD}  [1/3] Yanking crates${RESET}\n"
+for crate in "${CRATES[@]}"; do
+  for version in "${VERSIONS[@]}"; do
+    if cargo yank --version "${version}" "${crate}" 2>/dev/null; then
+      printf "    ${GREEN}yanked${RESET} %s@%s\n" "${crate}" "${version}"
+    else
+      printf "    ${DIM}skip${RESET}   %s@%s (already yanked or not found)\n" "${crate}" "${version}"
+    fi
+  done
+done
+
+# ── 2. Archive homebrew tap ─────────────────────────────────────
+printf "\n${BOLD}  [2/3] Archiving ${ORG}/homebrew-tap${RESET}\n"
+if gh repo archive "${ORG}/homebrew-tap" --yes 2>/dev/null; then
+  printf "    ${GREEN}archived${RESET} ${ORG}/homebrew-tap\n"
+else
+  printf "    ${DIM}skip${RESET}   already archived or not found\n"
+fi
+
+# ── 3. Delete GHCR container images ─────────────────────────────
+printf "\n${BOLD}  [3/3] Deleting container images from ghcr.io${RESET}\n"
+packages=$(gh api "orgs/${ORG}/packages?package_type=container" --jq '.[].name' 2>/dev/null || true)
+if [[ -z "${packages}" ]]; then
+  printf "    ${DIM}no container packages found${RESET}\n"
+else
+  for pkg in ${packages}; do
+    # Filter to sciotte-related packages
+    if [[ "${pkg}" == *sciotte* ]]; then
+      if gh api -X DELETE "orgs/${ORG}/packages/container/${pkg}" 2>/dev/null; then
+        printf "    ${GREEN}deleted${RESET} ghcr.io/${ORG}/%s\n" "${pkg}"
+      else
+        printf "    ${RED}failed${RESET}  ghcr.io/${ORG}/%s\n" "${pkg}"
+      fi
+    fi
+  done
+fi
+
+printf "\n${BOLD}  Done.${RESET}\n"
+printf "${DIM}  docs.rs will stop updating automatically now that crates are yanked.${RESET}\n\n"
