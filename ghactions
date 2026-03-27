@@ -95,6 +95,7 @@ W_STATUS=10
 W_STARTED=14
 W_FINISHED=14
 W_DURATION=10
+W_ETA=10
 W_FAILSINCE=12
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -138,6 +139,36 @@ parse_time() {
   date -j -f "%s" "${epoch}" "+%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:5:14}"
 }
 
+estimate_duration() {
+  local repo="$1" workflow_name="$2"
+  local repo_flag=()
+  [[ -n "${repo}" ]] && repo_flag=(--repo "${repo}")
+
+  # Get last successful run's start/end to estimate typical duration
+  local runs
+  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
+    --workflow "${workflow_name}" --branch "${BRANCH}" --limit 5 \
+    --status completed --json conclusion,startedAt,updatedAt 2>/dev/null) || { echo 0; return; }
+
+  # Find first successful run
+  local count
+  count=$(echo "${runs}" | jq 'length')
+  for (( j=0; j<count; j++ )); do
+    local c
+    c=$(echo "${runs}" | jq -r ".[$j].conclusion" 2>/dev/null || true)
+    if [[ "${c}" == "success" ]]; then
+      local s e
+      s=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$(echo "${runs}" | jq -r ".[$j].startedAt")" "+%s" 2>/dev/null || echo 0)
+      e=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$(echo "${runs}" | jq -r ".[$j].updatedAt")" "+%s" 2>/dev/null || echo 0)
+      if (( s > 0 && e > 0 )); then
+        echo $(( e - s ))
+        return
+      fi
+    fi
+  done
+  echo 0
+}
+
 find_failing_since() {
   local repo="$1" workflow_name="$2"
   local repo_flag=()
@@ -167,7 +198,7 @@ draw_border() {
   local max_len="$1" left="$2" mid="$3" right="$4"
   printf "%s" "${left}"
   printf '%*s' $((max_len + 2)) '' | tr ' ' '─'
-  for w in ${W_STATUS} ${W_STARTED} ${W_FINISHED} ${W_DURATION} ${W_FAILSINCE}; do
+  for w in ${W_STATUS} ${W_STARTED} ${W_FINISHED} ${W_DURATION} ${W_ETA} ${W_FAILSINCE}; do
     printf "%s" "${mid}"
     printf '%*s' $((w + 2)) '' | tr ' ' '─'
   done
@@ -221,8 +252,8 @@ display_repo() {
 
   draw_border "${max_len}" "┌" "┬" "┐"
 
-  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%-${W_STATUS}s${RESET} │ ${BOLD}%-${W_STARTED}s${RESET} │ ${BOLD}%-${W_FINISHED}s${RESET} │ ${BOLD}%-${W_DURATION}s${RESET} │ ${BOLD}%-${W_FAILSINCE}s${RESET} │\n" \
-    "Workflow" "Status" "Started" "Finished" "Duration" "Fail Since"
+  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%-${W_STATUS}s${RESET} │ ${BOLD}%-${W_STARTED}s${RESET} │ ${BOLD}%-${W_FINISHED}s${RESET} │ ${BOLD}%-${W_DURATION}s${RESET} │ ${BOLD}%-${W_ETA}s${RESET} │ ${BOLD}%-${W_FAILSINCE}s${RESET} │\n" \
+    "Workflow" "Status" "Started" "Finished" "Duration" "ETA" "Fail Since"
 
   draw_border "${max_len}" "├" "┼" "┤"
 
@@ -251,6 +282,9 @@ display_repo() {
       else
         duration_str="--"
       fi
+    elif [[ "${status}" == "queued" ]]; then
+      finished_display="--"
+      duration_str="queued"
     else
       finished_display="--"
       duration_str="running"
@@ -266,6 +300,33 @@ display_repo() {
       *:cancelled)   status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "cancelled")    ;;
       *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${conclusion}") ;;
     esac
+
+    # ETA for running workflows
+    local eta_display
+    if [[ "${status}" == "in_progress" || "${status}" == "queued" ]]; then
+      local est_seconds elapsed now_epoch remaining
+      est_seconds=$(estimate_duration "${repo}" "${name}")
+      if (( est_seconds > 0 )); then
+        now_epoch=$(date +%s)
+        local start_epoch
+        start_epoch=$(parse_epoch "${started_at}")
+        if (( start_epoch > 0 )); then
+          elapsed=$(( now_epoch - start_epoch ))
+          remaining=$(( est_seconds - elapsed ))
+          if (( remaining > 0 )); then
+            eta_display=$(printf "${YELLOW}%-${W_ETA}s${RESET}" "~$(format_duration ${remaining})")
+          else
+            eta_display=$(printf "${RED}%-${W_ETA}s${RESET}" "+$(format_duration $(( -remaining )))")
+          fi
+        else
+          eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+        fi
+      else
+        eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+      fi
+    else
+      eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+    fi
 
     # Failing since commit
     local fail_display
@@ -293,8 +354,8 @@ display_repo() {
     new_state=$(echo "${new_state}" | jq --arg k "${wf_key}" --arg v "${conclusion}" '.[$k] = $v')
 
     # Print row
-    printf "│ %-${max_len}s │ %s │ %-${W_STARTED}s │ %-${W_FINISHED}s │ %-${W_DURATION}s │ %s │\n" \
-      "${name}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${fail_display}"
+    printf "│ %-${max_len}s │ %s │ %-${W_STARTED}s │ %-${W_FINISHED}s │ %-${W_DURATION}s │ %s │ %s │\n" \
+      "${name}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${eta_display}" "${fail_display}"
   done
 
   draw_border "${max_len}" "└" "┴" "┘"

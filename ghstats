@@ -181,6 +181,10 @@ save_today() {
 
 format_delta() {
   local current="$1" previous="$2"
+  if [[ -z "${current}" || "${current}" == "null" ]]; then
+    printf "${DIM}%-8s${RESET}" "--"
+    return
+  fi
   if [[ -z "${previous}" || "${previous}" == "null" ]]; then
     printf "${DIM}%-8s${RESET}" "new"
     return
