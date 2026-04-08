@@ -14,7 +14,7 @@ set -euo pipefail
 
 # ── Parse flags ──────────────────────────────────────────────────
 WATCH=false
-WATCH_INTERVAL=300  # default 5 minutes
+WATCH_INTERVAL=3600  # default 1 hour
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +57,35 @@ RESET='\033[0m'
 UP_ARROW="▲"
 DOWN_ARROW="▼"
 DASH="─"
+
+# ── Notifications ────────────────────────────────────────────────
+notify_new_issues() {
+  local repo="$1" count="$2"
+  local url
+  url=$(gh api "search/issues?q=repo:${repo}+type:issue+state:open&sort=created&order=desc&per_page=1" \
+    --jq '.items[0].html_url' 2>/dev/null) || return 0
+  [[ -z "${url}" || "${url}" == "null" ]] && return 0
+  local msg="${count} new issue(s) on ${repo}"
+  if command -v terminal-notifier &>/dev/null; then
+    terminal-notifier -title "New Issue" -message "${msg}" -sound Pop -open "${url}" 2>/dev/null &
+  else
+    osascript -e "display notification \"${msg}\" with title \"New Issue\" sound name \"Pop\"" 2>/dev/null || true
+  fi
+}
+
+notify_new_prs() {
+  local repo="$1" count="$2"
+  local url
+  url=$(gh api "search/issues?q=repo:${repo}+type:pr+state:open&sort=created&order=desc&per_page=1" \
+    --jq '.items[0].html_url' 2>/dev/null) || return 0
+  [[ -z "${url}" || "${url}" == "null" ]] && return 0
+  local msg="${count} new PR(s) on ${repo}"
+  if command -v terminal-notifier &>/dev/null; then
+    terminal-notifier -title "New PR" -message "${msg}" -sound Pop -open "${url}" 2>/dev/null &
+  else
+    osascript -e "display notification \"${msg}\" with title \"New PR\" sound name \"Pop\"" 2>/dev/null || true
+  fi
+}
 
 # ── Helpers ──────────────────────────────────────────────────────
 ensure_config_dir() {
@@ -299,6 +328,24 @@ display_stats() {
     views_delta=$(format_delta "${views}" "${prev_views}")
     clones_delta=$(format_delta "${clones}" "${prev_clones}")
 
+    # Notify on new issues/PRs
+    if [[ -n "${prev_issues}" && "${prev_issues}" != "null" && "${issues}" != "null" ]]; then
+      local issues_diff=$(( issues - prev_issues ))
+      if (( issues_diff > 0 )); then
+        local canonical
+        canonical=$(gh api "repos/${repo}" --jq '.full_name' 2>/dev/null) || canonical="${repo}"
+        notify_new_issues "${canonical}" "${issues_diff}"
+      fi
+    fi
+    if [[ -n "${prev_prs}" && "${prev_prs}" != "null" && "${prs}" != "null" ]]; then
+      local prs_diff=$(( prs - prev_prs ))
+      if (( prs_diff > 0 )); then
+        local canonical
+        canonical=$(gh api "repos/${repo}" --jq '.full_name' 2>/dev/null) || canonical="${repo}"
+        notify_new_prs "${canonical}" "${prs_diff}"
+      fi
+    fi
+
     # Format views/clones: show "--" if no push access (null)
     local views_display clones_display
     if [[ "${views}" == "null" ]]; then views_display="--"; else views_display="${views}"; fi
@@ -320,7 +367,7 @@ display_stats() {
     printf "${clones_delta}"
     printf " │\n"
 
-    save_today "${repo}" "${stars}" "${forks}" "${watchers}" "${issues}" "${prs}" "${views}" "${clones}"
+    save_today "${repo}" "${stars}" "${forks}" "${watchers}" "${issues}" "${prs}" "${views}" "${clones}" || true
   done
 
   # Table footer

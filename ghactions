@@ -8,6 +8,7 @@
 #   ghactions -R repo1 -R repo2                # multiple repos
 #   ghactions owner/repo1 owner/repo2          # multiple repos (positional)
 #   ghactions -w [SECONDS]                     # watch mode (default 300s)
+#   ghactions -a                               # aggregate into single table
 #
 # Config file: ~/.config/ghactions/repos.conf  (one owner/repo per line)
 # Sends a desktop notification (with sound) when a workflow turns red.
@@ -18,6 +19,7 @@ set -euo pipefail
 WATCH=false
 WATCH_INTERVAL=300
 BRANCH="main"
+AGGREGATE=false
 REPOS=()
 POSITIONAL=()
 
@@ -29,6 +31,10 @@ while [[ $# -gt 0 ]]; do
         WATCH_INTERVAL="$2"
         shift
       fi
+      shift
+      ;;
+    -a|--aggregate)
+      AGGREGATE=true
       shift
       ;;
     -b|--branch)
@@ -139,16 +145,86 @@ parse_time() {
   date -j -f "%s" "${epoch}" "+%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:5:14}"
 }
 
+# ── Public repo detection & curl fallback ───────────────────────
+_PUBLIC_REPOS=""
+
+is_public_repo() {
+  local repo="$1"
+  case ",${_PUBLIC_REPOS}," in
+    *",${repo}:y,"*) return 0 ;;
+    *",${repo}:n,"*) return 1 ;;
+  esac
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" "https://api.github.com/repos/${repo}") || {
+    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:n"; return 1
+  }
+  if [[ "${code}" == "200" ]]; then
+    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:y"
+    return 0
+  else
+    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:n"
+    return 1
+  fi
+}
+
+# Fetch workflow runs — unauthenticated curl for public repos, gh CLI for private
+# Returns JSON array: [{workflowName, status, conclusion, startedAt, updatedAt, headSha}, ...]
+gh_fetch_runs() {
+  local repo="$1"; shift
+  local branch="${BRANCH}" limit=100 status_filter="" workflow=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)   branch="$2"; shift 2 ;;
+      --limit)    limit="$2"; shift 2 ;;
+      --status)   status_filter="$2"; shift 2 ;;
+      --workflow) workflow="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if is_public_repo "${repo}"; then
+    local curl_args=(-s -G "https://api.github.com/repos/${repo}/actions/runs"
+      --data-urlencode "branch=${branch}"
+      --data-urlencode "per_page=${limit}")
+    [[ -n "${status_filter}" ]] && curl_args+=(--data-urlencode "status=${status_filter}")
+    local raw
+    raw=$(curl "${curl_args[@]}" 2>/dev/null) || raw=""
+    # Fall back to gh if curl got rate-limited or returned no workflow_runs
+    if echo "${raw}" | jq -e '.workflow_runs' &>/dev/null; then
+      # Filter out Dependabot dynamic runs (event=="dynamic")
+      if [[ -n "${workflow}" ]]; then
+        echo "${raw}" | jq --arg wf "${workflow}" \
+          '[(.workflow_runs // [])[] | select(.event != "dynamic") | select(.name == $wf) | {
+            workflowName: .name, workflowId: .workflow_id, status, conclusion,
+            startedAt: .run_started_at, updatedAt: .updated_at, headSha: .head_sha
+          }]' 2>/dev/null
+      else
+        echo "${raw}" | jq \
+          '[(.workflow_runs // [])[] | select(.event != "dynamic") | {
+            workflowName: .name, workflowId: .workflow_id, status, conclusion,
+            startedAt: .run_started_at, updatedAt: .updated_at, headSha: .head_sha
+          }]' 2>/dev/null
+      fi
+      return
+    fi
+    # curl failed or rate-limited — fall through to gh
+  fi
+
+  local gh_args=(--repo "${repo}" --branch "${branch}" --limit "${limit}")
+  [[ -n "${status_filter}" ]] && gh_args+=(--status "${status_filter}")
+  [[ -n "${workflow}" ]] && gh_args+=(--workflow "${workflow}")
+  gh run list "${gh_args[@]}" \
+    --json workflowName,workflowDatabaseId,status,conclusion,startedAt,updatedAt,headSha 2>/dev/null | \
+    jq '[.[] | . + {workflowId: .workflowDatabaseId} | del(.workflowDatabaseId)]' 2>/dev/null
+}
+
 estimate_duration() {
   local repo="$1" workflow_name="$2"
-  local repo_flag=()
-  [[ -n "${repo}" ]] && repo_flag=(--repo "${repo}")
 
   # Get last successful run's start/end to estimate typical duration
   local runs
-  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
-    --workflow "${workflow_name}" --branch "${BRANCH}" --limit 5 \
-    --status completed --json conclusion,startedAt,updatedAt 2>/dev/null) || { echo 0; return; }
+  runs=$(gh_fetch_runs "${repo}" --workflow "${workflow_name}" --limit 50 --status completed) || { echo 0; return; }
 
   # Find first successful run
   local count
@@ -171,13 +247,9 @@ estimate_duration() {
 
 find_failing_since() {
   local repo="$1" workflow_name="$2"
-  local repo_flag=()
-  [[ -n "${repo}" ]] && repo_flag=(--repo "${repo}")
 
   local runs
-  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
-    --workflow "${workflow_name}" --branch "${BRANCH}" --limit 20 \
-    --json conclusion,headSha 2>/dev/null) || return
+  runs=$(gh_fetch_runs "${repo}" --workflow "${workflow_name}" --limit 50) || return 0
 
   # Walk newest to oldest, find the oldest consecutive failure
   local failing_sha="" count
@@ -214,19 +286,17 @@ display_repo() {
   local state_key
   state_key=$(echo "${repo}" | tr '/' '_')
 
-  # Fetch latest runs for the branch
+  # Fetch latest runs for the branch (curl for public repos, gh for private)
   local runs
-  runs=$(gh run list "${repo_flag[@]+"${repo_flag[@]}"}" \
-    --branch "${BRANCH}" --limit 100 \
-    --json workflowName,status,conclusion,startedAt,updatedAt,headSha 2>/dev/null) || {
+  runs=$(gh_fetch_runs "${repo}" --branch "${BRANCH}" --limit 100) || {
     printf "  ${RED}Failed to fetch runs for ${repo}${RESET}\n\n"
-    return
+    return 0
   }
 
-  # Latest run per workflow
+  # Latest run per workflow (group by workflowId to deduplicate renamed workflows)
   local workflows
   workflows=$(echo "${runs}" | jq '
-    group_by(.workflowName)
+    group_by(.workflowId // .workflowName)
     | map(sort_by(.startedAt) | reverse | .[0])
     | sort_by(.workflowName)
   ')
@@ -367,8 +437,201 @@ display_repo() {
   jq --arg k "${state_key}" --argjson v "${new_state}" '.[$k] = $v' "${STATE_FILE}" > "${tmp}" && mv "${tmp}" "${STATE_FILE}"
 }
 
+# ── Aggregate display (single table) ────────────────────────────
+display_aggregate() {
+  local now
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+
+  echo ""
+  if [[ "${WATCH}" == true ]]; then
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n"
+  else
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})${RESET}\n"
+  fi
+  echo ""
+
+  # Collect all rows: repo short_name + workflow data
+  local all_rows=()
+  local max_len=8
+
+  for repo in "${REPOS[@]}"; do
+    # Short name: strip org prefix
+    local short_name
+    short_name=$(echo "${repo}" | sed -E 's|.*/||')
+
+    local runs
+    runs=$(gh_fetch_runs "${repo}" --branch "${BRANCH}" --limit 100) || continue
+
+    local workflows
+    workflows=$(echo "${runs}" | jq '
+      group_by(.workflowId // .workflowName)
+      | map(sort_by(.startedAt) | reverse | .[0])
+      | sort_by(.workflowName)
+    ')
+
+    local count
+    count=$(echo "${workflows}" | jq 'length')
+
+    for (( i=0; i<count; i++ )); do
+      local wf_name
+      wf_name=$(echo "${workflows}" | jq -r ".[$i].workflowName" 2>/dev/null || echo "unknown")
+      local label="${short_name}/${wf_name}"
+      (( ${#label} > max_len )) && max_len=${#label}
+
+      local row_json
+      row_json=$(echo "${workflows}" | jq -c ".[$i]" 2>/dev/null)
+      all_rows+=("${repo}|${label}|${row_json}")
+    done
+  done
+
+  if [[ ${#all_rows[@]} -eq 0 ]]; then
+    printf "  ${DIM}No workflow runs found${RESET}\n\n"
+    return
+  fi
+
+  # Load full state for transition detection
+  local agg_prev_state agg_new_state="{}"
+  agg_prev_state=$(cat "${STATE_FILE}" 2>/dev/null || echo '{}')
+
+  draw_border "${max_len}" "┌" "┬" "┐"
+
+  printf "│ ${BOLD}%-${max_len}s${RESET} │ ${BOLD}%-${W_STATUS}s${RESET} │ ${BOLD}%-${W_STARTED}s${RESET} │ ${BOLD}%-${W_FINISHED}s${RESET} │ ${BOLD}%-${W_DURATION}s${RESET} │ ${BOLD}%-${W_ETA}s${RESET} │ ${BOLD}%-${W_FAILSINCE}s${RESET} │\n" \
+    "Repo/Workflow" "Status" "Started" "Finished" "Duration" "ETA" "Fail Since"
+
+  draw_border "${max_len}" "├" "┼" "┤"
+
+  local prev_short=""
+
+  for row in "${all_rows[@]}"; do
+    local repo label row_json
+    repo="${row%%|*}"
+    local rest="${row#*|}"
+    label="${rest%%|*}"
+    row_json="${rest#*|}"
+
+    local state_key
+    state_key=$(echo "${repo}" | tr '/' '_')
+
+    local name status conclusion started_at updated_at
+    name=$(echo "${row_json}" | jq -r '.workflowName' 2>/dev/null || echo "unknown")
+    status=$(echo "${row_json}" | jq -r '.status' 2>/dev/null || echo "unknown")
+    conclusion=$(echo "${row_json}" | jq -r '.conclusion' 2>/dev/null || echo "unknown")
+    started_at=$(echo "${row_json}" | jq -r '.startedAt' 2>/dev/null || echo "null")
+    updated_at=$(echo "${row_json}" | jq -r '.updatedAt' 2>/dev/null || echo "null")
+
+    # Separator between repos
+    local cur_short="${label%%/*}"
+    if [[ -n "${prev_short}" && "${cur_short}" != "${prev_short}" ]]; then
+      draw_border "${max_len}" "├" "┼" "┤"
+    fi
+    prev_short="${cur_short}"
+
+    # Time
+    local started_display finished_display duration_str
+    started_display=$(parse_time "${started_at}")
+    if [[ "${status}" == "completed" ]]; then
+      finished_display=$(parse_time "${updated_at}")
+      local s_epoch f_epoch
+      s_epoch=$(parse_epoch "${started_at}")
+      f_epoch=$(parse_epoch "${updated_at}")
+      if (( s_epoch > 0 && f_epoch > 0 )); then
+        duration_str=$(format_duration $(( f_epoch - s_epoch )))
+      else
+        duration_str="--"
+      fi
+    elif [[ "${status}" == "queued" ]]; then
+      finished_display="--"
+      duration_str="queued"
+    else
+      finished_display="--"
+      duration_str="running"
+    fi
+
+    # Status with color
+    local status_display
+    case "${status}:${conclusion}" in
+      in_progress:*) status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "running")   ;;
+      queued:*)      status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "queued")       ;;
+      *:success)     status_display=$(printf "${GREEN}%-${W_STATUS}s${RESET}" "pass")       ;;
+      *:failure)     status_display=$(printf "${RED}%-${W_STATUS}s${RESET}" "FAIL")         ;;
+      *:cancelled)   status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "cancelled")    ;;
+      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${conclusion}") ;;
+    esac
+
+    # ETA
+    local eta_display
+    if [[ "${status}" == "in_progress" || "${status}" == "queued" ]]; then
+      local est_seconds elapsed now_epoch remaining
+      est_seconds=$(estimate_duration "${repo}" "${name}")
+      if (( est_seconds > 0 )); then
+        now_epoch=$(date +%s)
+        local start_epoch
+        start_epoch=$(parse_epoch "${started_at}")
+        if (( start_epoch > 0 )); then
+          elapsed=$(( now_epoch - start_epoch ))
+          remaining=$(( est_seconds - elapsed ))
+          if (( remaining > 0 )); then
+            eta_display=$(printf "${YELLOW}%-${W_ETA}s${RESET}" "~$(format_duration ${remaining})")
+          else
+            eta_display=$(printf "${RED}%-${W_ETA}s${RESET}" "+$(format_duration $(( -remaining )))")
+          fi
+        else
+          eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+        fi
+      else
+        eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+      fi
+    else
+      eta_display=$(printf "${DIM}%-${W_ETA}s${RESET}" "--")
+    fi
+
+    # Failing since
+    local fail_display
+    if [[ "${conclusion}" == "failure" ]]; then
+      local fail_sha
+      fail_sha=$(find_failing_since "${repo}" "${name}" || true)
+      if [[ -n "${fail_sha}" ]]; then
+        fail_display=$(printf "${RED}%-${W_FAILSINCE}s${RESET}" "${fail_sha:0:7}")
+      else
+        fail_display=$(printf "${DIM}%-${W_FAILSINCE}s${RESET}" "--")
+      fi
+    else
+      fail_display=$(printf "${DIM}%-${W_FAILSINCE}s${RESET}" "--")
+    fi
+
+    # State transition detection & notification
+    local wf_key prev_conclusion
+    wf_key=$(echo "${name}" | tr ' ' '_')
+    prev_conclusion=$(echo "${agg_prev_state}" | jq -r --arg rk "${state_key}" --arg wk "${wf_key}" '.[$rk][$wk] // empty' 2>/dev/null || true)
+    if [[ "${conclusion}" == "failure" && "${prev_conclusion}" == "success" ]]; then
+      notify_failure "${name}" "${repo}"
+    elif [[ "${conclusion}" == "success" && "${prev_conclusion}" == "failure" ]]; then
+      notify_recovery "${name}" "${repo}"
+    fi
+    agg_new_state=$(echo "${agg_new_state}" | jq --arg rk "${state_key}" --arg wk "${wf_key}" --arg v "${conclusion}" \
+      '.[$rk] = ((.[$rk] // {}) | .[$wk] = $v)' 2>/dev/null || echo "${agg_new_state}")
+
+    # Print row
+    printf "│ %-${max_len}s │ %s │ %-${W_STARTED}s │ %-${W_FINISHED}s │ %-${W_DURATION}s │ %s │ %s │\n" \
+      "${label}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${eta_display}" "${fail_display}"
+  done
+
+  draw_border "${max_len}" "└" "┴" "┘"
+  echo ""
+
+  # Batch save state
+  local tmp
+  tmp=$(mktemp)
+  jq -s '.[0] * .[1]' "${STATE_FILE}" <(echo "${agg_new_state}") > "${tmp}" 2>/dev/null && mv "${tmp}" "${STATE_FILE}" || rm -f "${tmp}"
+}
+
 # ── Main display (all repos) ────────────────────────────────────
 display_all() {
+  if [[ "${AGGREGATE}" == true ]]; then
+    display_aggregate
+    return
+  fi
+
   local now
   now=$(date '+%Y-%m-%d %H:%M:%S')
 
