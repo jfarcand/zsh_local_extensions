@@ -219,6 +219,24 @@ gh_fetch_runs() {
     jq '[.[] | . + {workflowId: .workflowDatabaseId} | del(.workflowDatabaseId)]' 2>/dev/null
 }
 
+# Fetch active workflow IDs for a repo (filters out deleted/disabled workflows)
+# Returns JSON array of workflow IDs: [123, 456, ...]
+gh_active_workflow_ids() {
+  local repo="$1"
+
+  if is_public_repo "${repo}"; then
+    local raw
+    raw=$(curl -s "https://api.github.com/repos/${repo}/actions/workflows" 2>/dev/null) || raw=""
+    if echo "${raw}" | jq -e '.workflows' &>/dev/null; then
+      echo "${raw}" | jq '[.workflows[] | select(.state == "active") | .id]' 2>/dev/null
+      return
+    fi
+  fi
+
+  gh api "repos/${repo}/actions/workflows" \
+    --jq '[.workflows[] | select(.state == "active") | .id]' 2>/dev/null
+}
+
 estimate_duration() {
   local repo="$1" workflow_name="$2"
 
@@ -292,6 +310,14 @@ display_repo() {
     printf "  ${RED}Failed to fetch runs for ${repo}${RESET}\n\n"
     return 0
   }
+
+  # Filter to only active workflows (exclude deleted/disabled)
+  local active_ids
+  active_ids=$(gh_active_workflow_ids "${repo}" 2>/dev/null) || active_ids="[]"
+  if [[ "${active_ids}" != "[]" ]]; then
+    runs=$(echo "${runs}" | jq --argjson ids "${active_ids}" \
+      '[.[] | select(.workflowId as $wid | $ids | index($wid))]')
+  fi
 
   # Latest run per workflow (group by workflowId to deduplicate renamed workflows)
   local workflows
@@ -461,6 +487,14 @@ display_aggregate() {
 
     local runs
     runs=$(gh_fetch_runs "${repo}" --branch "${BRANCH}" --limit 100) || continue
+
+    # Filter to only active workflows
+    local active_ids
+    active_ids=$(gh_active_workflow_ids "${repo}" 2>/dev/null) || active_ids="[]"
+    if [[ "${active_ids}" != "[]" ]]; then
+      runs=$(echo "${runs}" | jq --argjson ids "${active_ids}" \
+        '[.[] | select(.workflowId as $wid | $ids | index($wid))]')
+    fi
 
     local workflows
     workflows=$(echo "${runs}" | jq '

@@ -42,4 +42,4 @@ done
 model="${models[$family]}"
 
 echo "Using model: $model"
-exec copilot --allow-all-tools --allow-all-paths --model="$model" "${passthrough[@]}"
+exec copilot --allow-all --model="$model" "${passthrough[@]}"
