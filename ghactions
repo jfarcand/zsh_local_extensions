@@ -17,7 +17,7 @@ set -euo pipefail
 
 # ── Parse flags ──────────────────────────────────────────────────
 WATCH=false
-WATCH_INTERVAL=300
+WATCH_INTERVAL=21600  # default 6 hours
 BRANCH="main"
 AGGREGATE=false
 REPOS=()
@@ -145,30 +145,8 @@ parse_time() {
   date -j -f "%s" "${epoch}" "+%m-%d %H:%M:%S" 2>/dev/null || echo "${ts:5:14}"
 }
 
-# ── Public repo detection & curl fallback ───────────────────────
-_PUBLIC_REPOS=""
-
-is_public_repo() {
-  local repo="$1"
-  case ",${_PUBLIC_REPOS}," in
-    *",${repo}:y,"*) return 0 ;;
-    *",${repo}:n,"*) return 1 ;;
-  esac
-  local code
-  code=$(curl -s -o /dev/null -w "%{http_code}" "https://api.github.com/repos/${repo}") || {
-    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:n"; return 1
-  }
-  if [[ "${code}" == "200" ]]; then
-    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:y"
-    return 0
-  else
-    _PUBLIC_REPOS="${_PUBLIC_REPOS},${repo}:n"
-    return 1
-  fi
-}
-
-# Fetch workflow runs — unauthenticated curl for public repos, gh CLI for private
-# Returns JSON array: [{workflowName, status, conclusion, startedAt, updatedAt, headSha}, ...]
+# Fetch workflow runs via gh CLI
+# Returns JSON array: [{workflowName, workflowId, status, conclusion, startedAt, updatedAt, headSha}, ...]
 gh_fetch_runs() {
   local repo="$1"; shift
   local branch="${BRANCH}" limit=100 status_filter="" workflow=""
@@ -183,34 +161,6 @@ gh_fetch_runs() {
     esac
   done
 
-  if is_public_repo "${repo}"; then
-    local curl_args=(-s -G "https://api.github.com/repos/${repo}/actions/runs"
-      --data-urlencode "branch=${branch}"
-      --data-urlencode "per_page=${limit}")
-    [[ -n "${status_filter}" ]] && curl_args+=(--data-urlencode "status=${status_filter}")
-    local raw
-    raw=$(curl "${curl_args[@]}" 2>/dev/null) || raw=""
-    # Fall back to gh if curl got rate-limited or returned no workflow_runs
-    if echo "${raw}" | jq -e '.workflow_runs' &>/dev/null; then
-      # Filter out Dependabot dynamic runs (event=="dynamic")
-      if [[ -n "${workflow}" ]]; then
-        echo "${raw}" | jq --arg wf "${workflow}" \
-          '[(.workflow_runs // [])[] | select(.event != "dynamic") | select(.name == $wf) | {
-            workflowName: .name, workflowId: .workflow_id, status, conclusion,
-            startedAt: .run_started_at, updatedAt: .updated_at, headSha: .head_sha
-          }]' 2>/dev/null
-      else
-        echo "${raw}" | jq \
-          '[(.workflow_runs // [])[] | select(.event != "dynamic") | {
-            workflowName: .name, workflowId: .workflow_id, status, conclusion,
-            startedAt: .run_started_at, updatedAt: .updated_at, headSha: .head_sha
-          }]' 2>/dev/null
-      fi
-      return
-    fi
-    # curl failed or rate-limited — fall through to gh
-  fi
-
   local gh_args=(--repo "${repo}" --branch "${branch}" --limit "${limit}")
   [[ -n "${status_filter}" ]] && gh_args+=(--status "${status_filter}")
   [[ -n "${workflow}" ]] && gh_args+=(--workflow "${workflow}")
@@ -223,16 +173,6 @@ gh_fetch_runs() {
 # Returns JSON array of workflow IDs: [123, 456, ...]
 gh_active_workflow_ids() {
   local repo="$1"
-
-  if is_public_repo "${repo}"; then
-    local raw
-    raw=$(curl -s "https://api.github.com/repos/${repo}/actions/workflows" 2>/dev/null) || raw=""
-    if echo "${raw}" | jq -e '.workflows' &>/dev/null; then
-      echo "${raw}" | jq '[.workflows[] | select(.state == "active") | .id]' 2>/dev/null
-      return
-    fi
-  fi
-
   gh api "repos/${repo}/actions/workflows" \
     --jq '[.workflows[] | select(.state == "active") | .id]' 2>/dev/null
 }
@@ -391,10 +331,13 @@ display_repo() {
     case "${status}:${conclusion}" in
       in_progress:*) status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "running")   ;;
       queued:*)      status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "queued")       ;;
+      pending:*)     status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "pending")    ;;
+      waiting:*)     status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "waiting")    ;;
+      requested:*)   status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "requested")  ;;
       *:success)     status_display=$(printf "${GREEN}%-${W_STATUS}s${RESET}" "pass")       ;;
       *:failure)     status_display=$(printf "${RED}%-${W_STATUS}s${RESET}" "FAIL")         ;;
       *:cancelled)   status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "cancelled")    ;;
-      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${conclusion}") ;;
+      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${status}")     ;;
     esac
 
     # ETA for running workflows
@@ -586,10 +529,13 @@ display_aggregate() {
     case "${status}:${conclusion}" in
       in_progress:*) status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "running")   ;;
       queued:*)      status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "queued")       ;;
+      pending:*)     status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "pending")    ;;
+      waiting:*)     status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "waiting")    ;;
+      requested:*)   status_display=$(printf "${YELLOW}%-${W_STATUS}s${RESET}" "requested")  ;;
       *:success)     status_display=$(printf "${GREEN}%-${W_STATUS}s${RESET}" "pass")       ;;
       *:failure)     status_display=$(printf "${RED}%-${W_STATUS}s${RESET}" "FAIL")         ;;
       *:cancelled)   status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "cancelled")    ;;
-      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${conclusion}") ;;
+      *)             status_display=$(printf "${DIM}%-${W_STATUS}s${RESET}" "${status}")     ;;
     esac
 
     # ETA
