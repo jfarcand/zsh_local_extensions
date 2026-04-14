@@ -7,7 +7,7 @@ set -euo pipefail
 # Model mapping — update these when copilot adds new models.
 # Run `copilot` interactively to see the current model list.
 typeset -A models=(
-  [opus]="claude-opus-4.6-fast"
+  [opus]="claude-opus-4.6"
   [sonnet]="claude-sonnet-4"
   [gemini]="gemini-3-pro"
   [gpt]="gpt-5.3-codex"
@@ -26,6 +26,7 @@ usage() {
 }
 
 family="sonnet"
+effort="xhigh"
 passthrough=()
 
 for arg in "$@"; do
@@ -34,6 +35,7 @@ for arg in "$@"; do
     --sonnet)  family="sonnet" ;;
     --gemini)  family="gemini" ;;
     --gpt)     family="gpt" ;;
+    --effort=*) effort="${arg#--effort=}" ;;
     --help|-h) usage ;;
     *)         passthrough+=("$arg") ;;
   esac
@@ -41,5 +43,5 @@ done
 
 model="${models[$family]}"
 
-echo "Using model: $model"
-exec copilot --allow-all --model="$model" "${passthrough[@]}"
+echo "Using model: $model (${effort})"
+exec copilot --allow-all --model="$model" --reasoning-effort="$effort" "${passthrough[@]}"

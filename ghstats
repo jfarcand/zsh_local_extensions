@@ -14,7 +14,7 @@ set -euo pipefail
 
 # ── Parse flags ──────────────────────────────────────────────────
 WATCH=false
-WATCH_INTERVAL=3600  # default 1 hour
+WATCH_INTERVAL=21600  # default 6 hours
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
