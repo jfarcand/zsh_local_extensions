@@ -7,7 +7,7 @@ set -euo pipefail
 # Model mapping — update these when copilot adds new models.
 # Run `copilot` interactively to see the current model list.
 typeset -A models=(
-  [opus]="claude-opus-4.6"
+  [opus]="claude-opus-4.7"
   [sonnet]="claude-sonnet-4"
   [gemini]="gemini-3-pro"
   [gpt]="gpt-5.3-codex"

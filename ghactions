@@ -104,6 +104,14 @@ W_DURATION=10
 W_ETA=10
 W_FAILSINCE=12
 
+# Sanitize a string for fixed-width terminal display (replace wide Unicode with ASCII)
+sanitize_display() {
+  local str="$1"
+  str="${str//—/-}"
+  str="${str//–/-}"
+  echo "${str}"
+}
+
 # ── Helpers ──────────────────────────────────────────────────────
 notify_failure() {
   local workflow="$1" repo_display="$2"
@@ -280,6 +288,7 @@ display_repo() {
   for (( i=0; i<count; i++ )); do
     local name
     name=$(echo "${workflows}" | jq -r ".[$i].workflowName")
+    name=$(sanitize_display "${name}")
     (( ${#name} > max_len )) && max_len=${#name}
   done
 
@@ -298,8 +307,9 @@ display_repo() {
   prev_state=$(jq -r --arg k "${state_key}" '.[$k] // {}' "${STATE_FILE}" 2>/dev/null || echo '{}')
 
   for (( i=0; i<count; i++ )); do
-    local name status conclusion started_at updated_at
+    local name display_name status conclusion started_at updated_at
     name=$(echo "${workflows}" | jq -r ".[$i].workflowName" 2>/dev/null || echo "unknown")
+    display_name=$(sanitize_display "${name}")
     status=$(echo "${workflows}" | jq -r ".[$i].status" 2>/dev/null || echo "unknown")
     conclusion=$(echo "${workflows}" | jq -r ".[$i].conclusion" 2>/dev/null || echo "unknown")
     started_at=$(echo "${workflows}" | jq -r ".[$i].startedAt" 2>/dev/null || echo "null")
@@ -394,7 +404,7 @@ display_repo() {
 
     # Print row
     printf "│ %-${max_len}s │ %s │ %-${W_STARTED}s │ %-${W_FINISHED}s │ %-${W_DURATION}s │ %s │ %s │\n" \
-      "${name}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${eta_display}" "${fail_display}"
+      "${display_name}" "${status_display}" "${started_display}" "${finished_display}" "${duration_str}" "${eta_display}" "${fail_display}"
   done
 
   draw_border "${max_len}" "└" "┴" "┘"
@@ -452,7 +462,7 @@ display_aggregate() {
     for (( i=0; i<count; i++ )); do
       local wf_name
       wf_name=$(echo "${workflows}" | jq -r ".[$i].workflowName" 2>/dev/null || echo "unknown")
-      local label="${short_name}/${wf_name}"
+      local label="${short_name}/$(sanitize_display "${wf_name}")"
       (( ${#label} > max_len )) && max_len=${#label}
 
       local row_json

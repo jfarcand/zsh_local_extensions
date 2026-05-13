@@ -123,11 +123,16 @@ load_repos() {
 fetch_repo() {
   local repo="$1"
   local canonical_repo repo_data issues_count prs_count views_count clones_count
-  # Resolve canonical name (handles renames/redirects)
-  canonical_repo=$(gh api "repos/${repo}" --jq '.full_name' 2>/dev/null) || return 1
-  repo_data=$(gh api "repos/${canonical_repo}" --jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}' 2>/dev/null) || return 1
-  issues_count=$(gh api "search/issues?q=repo:${canonical_repo}+type:issue+state:open" --jq '.total_count' 2>/dev/null) || issues_count=0
-  prs_count=$(gh api "search/issues?q=repo:${canonical_repo}+type:pr+state:open" --jq '.total_count' 2>/dev/null) || prs_count=0
+  # Resolve canonical name and fetch repo data in one call
+  local full_data
+  full_data=$(gh api "repos/${repo}" 2>/dev/null) || return 1
+  canonical_repo=$(echo "${full_data}" | jq -r '.full_name')
+  repo_data=$(echo "${full_data}" | jq '{stars: .stargazers_count, forks: .forks_count, watchers: .subscribers_count}')
+  # Use repos API instead of search API (search has 30 req/min limit)
+  local open_total
+  open_total=$(echo "${full_data}" | jq '.open_issues_count')
+  prs_count=$(gh api "repos/${canonical_repo}/pulls?state=open&per_page=100" --jq 'length' 2>/dev/null) || prs_count=0
+  issues_count=$(( open_total - prs_count ))
   # Traffic requires push access — gracefully degrade
   views_count=$(gh api "repos/${canonical_repo}/traffic/views" --jq '.count' 2>/dev/null) || views_count=null
   clones_count=$(gh api "repos/${canonical_repo}/traffic/clones" --jq '.count' 2>/dev/null) || clones_count=null
