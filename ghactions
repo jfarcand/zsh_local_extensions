@@ -7,7 +7,7 @@
 #   ghactions -R owner/repo                    # specific repo
 #   ghactions -R repo1 -R repo2                # multiple repos
 #   ghactions owner/repo1 owner/repo2          # multiple repos (positional)
-#   ghactions -w [SECONDS]                     # watch mode (default 300s)
+#   ghactions -w [SECONDS]                     # watch mode (default 3600s = 1h, press 'r' to refresh)
 #   ghactions -a                               # aggregate into single table
 #
 # Config file: ~/.config/ghactions/repos.conf  (one owner/repo per line)
@@ -17,7 +17,7 @@ set -euo pipefail
 
 # ── Parse flags ──────────────────────────────────────────────────
 WATCH=false
-WATCH_INTERVAL=600  # default 10 minutes
+WATCH_INTERVAL=3600  # default 1 hour
 BRANCH="main"
 AGGREGATE=false
 REPOS=()
@@ -423,7 +423,7 @@ display_aggregate() {
 
   echo ""
   if [[ "${WATCH}" == true ]]; then
-    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n"
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — press 'r' to refresh, Ctrl-C to stop${RESET}\n"
   else
     printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})${RESET}\n"
   fi
@@ -627,7 +627,7 @@ display_all() {
 
   echo ""
   if [[ "${WATCH}" == true ]]; then
-    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n"
+    printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})  ⟳ every ${WATCH_INTERVAL}s — press 'r' to refresh, Ctrl-C to stop${RESET}\n"
   else
     printf "${BOLD}${CYAN}  GitHub Actions ${RESET}${DIM}(${now})${RESET}\n"
   fi
@@ -639,13 +639,31 @@ display_all() {
 }
 
 # ── Run (once or watch) ─────────────────────────────────────────
+# Wait up to WATCH_INTERVAL seconds, returning early if the user presses 'r'.
+# Tracks elapsed time so non-'r' keypresses don't reset the timer.
+wait_or_refresh() {
+  local end_at=$(( $(date +%s) + WATCH_INTERVAL ))
+  local now remaining key
+  while true; do
+    now=$(date +%s)
+    remaining=$(( end_at - now ))
+    (( remaining <= 0 )) && break
+    if read -t "${remaining}" -n 1 -s key < /dev/tty; then
+      [[ "${key}" == "r" || "${key}" == "R" ]] && break
+      # any other key: ignore, keep waiting with the remaining budget
+    else
+      break  # timed out — natural refresh
+    fi
+  done
+}
+
 if [[ "${WATCH}" == true ]]; then
   trap 'printf "\033[?25h\n${DIM}  Stopped.${RESET}\n"; exit 0' INT
   printf '\033[?25l'
   while true; do
     printf '\033[H\033[2J\033[3J' > /dev/tty
     display_all
-    sleep "${WATCH_INTERVAL}"
+    wait_or_refresh
   done
 else
   display_all
