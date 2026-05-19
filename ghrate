@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# ghrate - Show GitHub API rate limit status and when it resets (EDT)
+#
+# Usage:
+#   ghrate                  # show all resource buckets
+#   ghrate core             # show only the "core" bucket
+#   ghrate -w [SECONDS]     # watch mode, refresh every N seconds (default 30)
+#   ghrate --burn [SECONDS] # measure burn rate over N seconds (default 10)
+
+set -euo pipefail
+
+WATCH=false
+WATCH_INTERVAL=30
+BURN=false
+BURN_INTERVAL=10
+FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)
+      WATCH=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        WATCH_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    --burn)
+      BURN=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        BURN_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,8p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      FILTER="$1"
+      shift
+      ;;
+  esac
+done
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# Format an epoch as EDT (America/New_York) plus a human delta from now.
+format_reset() {
+  local epoch="$1"
+  local now delta sign abs_delta hrs mins secs when_str delta_str
+  now=$(date +%s)
+  delta=$(( epoch - now ))
+  if (( delta < 0 )); then
+    sign="-"
+    abs_delta=$(( -delta ))
+  else
+    sign=""
+    abs_delta=$delta
+  fi
+  hrs=$(( abs_delta / 3600 ))
+  mins=$(( (abs_delta % 3600) / 60 ))
+  secs=$(( abs_delta % 60 ))
+
+  if (( hrs > 0 )); then
+    delta_str=$(printf "%s%dh%02dm%02ds" "$sign" "$hrs" "$mins" "$secs")
+  elif (( mins > 0 )); then
+    delta_str=$(printf "%s%dm%02ds" "$sign" "$mins" "$secs")
+  else
+    delta_str=$(printf "%s%ds" "$sign" "$secs")
+  fi
+
+  # America/New_York gives EDT in summer, EST in winter — labelled by %Z.
+  when_str=$(TZ="America/New_York" date -r "$epoch" "+%Y-%m-%d %H:%M:%S %Z")
+  echo "${when_str} (in ${delta_str})"
+}
+
+print_bucket() {
+  local name="$1" limit="$2" used="$3" remaining="$4" reset="$5"
+  local color when
+
+  if (( remaining == 0 )); then
+    color="$RED"
+  elif (( remaining < limit / 10 )); then
+    color="$YELLOW"
+  else
+    color="$GREEN"
+  fi
+
+  when=$(format_reset "$reset")
+
+  printf "${BOLD}%-22s${RESET} ${color}%5d / %-5d remaining${RESET}  ${DIM}used %-5d${RESET}  resets ${BOLD}%s${RESET}\n" \
+    "$name" "$remaining" "$limit" "$used" "$when"
+}
+
+show_status() {
+  local json
+  if ! json=$(gh api rate_limit 2>/dev/null); then
+    echo "ghrate: failed to call 'gh api rate_limit' — is gh installed and authenticated?" >&2
+    return 1
+  fi
+
+  local now_str
+  now_str=$(TZ="America/New_York" date "+%Y-%m-%d %H:%M:%S %Z")
+  printf "${DIM}as of %s${RESET}\n" "$now_str"
+
+  local jq_filter='.resources | to_entries[] | "\(.key)\t\(.value.limit)\t\(.value.used)\t\(.value.remaining)\t\(.value.reset)"'
+
+  while IFS=$'\t' read -r name limit used remaining reset; do
+    if [[ -n "$FILTER" && "$name" != "$FILTER" ]]; then
+      continue
+    fi
+    print_bucket "$name" "$limit" "$used" "$remaining" "$reset"
+  done < <(echo "$json" | jq -r "$jq_filter")
+}
+
+fetch_used() {
+  # Print "name<TAB>used<TAB>limit<TAB>remaining<TAB>reset" for each bucket.
+  gh api rate_limit 2>/dev/null \
+    | jq -r '.resources | to_entries[] | "\(.key)\t\(.value.used)\t\(.value.limit)\t\(.value.remaining)\t\(.value.reset)"'
+}
+
+show_burn() {
+  local target="${FILTER:-core}"
+  local snap1 snap2 t1 t2 used1 used2 lim rem2 reset2 delta rate eta_sec eta_str
+
+  printf "${DIM}sampling '%s' over %ds…${RESET}\n" "$target" "$BURN_INTERVAL"
+  snap1=$(fetch_used) || { echo "ghrate: gh api rate_limit failed" >&2; return 1; }
+  t1=$(date +%s)
+  sleep "$BURN_INTERVAL"
+  snap2=$(fetch_used) || { echo "ghrate: gh api rate_limit failed" >&2; return 1; }
+  t2=$(date +%s)
+
+  used1=$(echo "$snap1" | awk -v t="$target" -F'\t' '$1==t{print $2}')
+  read -r used2 lim rem2 reset2 < <(echo "$snap2" | awk -v t="$target" -F'\t' '$1==t{print $2"\t"$3"\t"$4"\t"$5}')
+
+  if [[ -z "$used1" || -z "$used2" ]]; then
+    echo "ghrate: bucket '$target' not found" >&2
+    return 1
+  fi
+
+  delta=$(( used2 - used1 ))
+  local elapsed=$(( t2 - t1 ))
+  (( elapsed == 0 )) && elapsed=1
+
+  # Rate in requests/sec, two decimals via awk
+  rate=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN{printf "%.2f", d/e}')
+
+  printf "${BOLD}%s${RESET}: ${BOLD}%d${RESET} requests in ${BOLD}%ds${RESET}  →  ${BOLD}%s req/s${RESET}  (${DIM}%.1f req/min${RESET})\n" \
+    "$target" "$delta" "$elapsed" "$rate" "$(awk -v r="$rate" 'BEGIN{print r*60}')"
+
+  if (( delta > 0 && rem2 > 0 )); then
+    eta_sec=$(awk -v r="$rem2" -v rate="$rate" 'BEGIN{ if(rate>0) printf "%d", r/rate; else print 999999 }')
+    if (( eta_sec < 999999 )); then
+      local eta_h=$(( eta_sec / 3600 ))
+      local eta_m=$(( (eta_sec % 3600) / 60 ))
+      local eta_s=$(( eta_sec % 60 ))
+      if (( eta_h > 0 )); then
+        eta_str=$(printf "%dh%02dm%02ds" "$eta_h" "$eta_m" "$eta_s")
+      else
+        eta_str=$(printf "%dm%02ds" "$eta_m" "$eta_s")
+      fi
+      local exhaust_epoch=$(( t2 + eta_sec ))
+      local exhaust_when
+      exhaust_when=$(TZ="America/New_York" date -r "$exhaust_epoch" "+%H:%M:%S %Z")
+      printf "at this rate, ${BOLD}%d${RESET} remaining exhaust in ${BOLD}%s${RESET} (≈ %s)\n" \
+        "$rem2" "$eta_str" "$exhaust_when"
+    fi
+  fi
+
+  printf "window resets %s\n" "$(format_reset "$reset2")"
+}
+
+if $BURN; then
+  show_burn
+elif $WATCH; then
+  while true; do
+    clear
+    show_status || true
+    printf "\n${DIM}refreshing every %ds — Ctrl-C to stop${RESET}\n" "$WATCH_INTERVAL"
+    sleep "$WATCH_INTERVAL"
+  done
+else
+  show_status
+fi
