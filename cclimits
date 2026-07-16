@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# cclimits - Claude Code usage limits (session + weekly) with macOS notifications
+#
+# Usage:
+#   cclimits                     # show usage once (and notify if a threshold was crossed)
+#   cclimits -w [SECONDS]        # watch mode, refresh every N seconds (default 60)
+#   cclimits --start N           # notifications start at N% (default 60)
+#   cclimits --step N            # below critical, notify every N% (default 10)
+#   cclimits --critical N        # from N% on, notify every 1% (default 90)
+#   cclimits --no-alert          # display only, never notify
+#   cclimits --test              # fire a test macOS notification and exit
+#   cclimits --reset             # clear saved notification state
+#
+# Reads the Claude Code OAuth token from the macOS Keychain and calls the same
+# usage endpoint the /usage command uses (does not consume usage). Notification
+# state persists in ~/.local/state/cclimits so one-shot runs (cron/launchd) and
+# watch mode both avoid re-notifying for the same threshold.
+
+set -euo pipefail
+
+WATCH=false
+WATCH_INTERVAL=60
+WATCH_MAX_SECONDS=21600   # auto-exit watch after 6h so a forgotten loop can't linger
+START_AT=60
+STEP=10
+CRITICAL_AT=90
+ALERT_ENABLED=true
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits"
+STATE_FILE="$STATE_DIR/state"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)
+      WATCH=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        WATCH_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    --start)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        START_AT="$2"
+        shift 2
+      else
+        echo "cclimits: --start requires a number" >&2
+        exit 1
+      fi
+      ;;
+    --step)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        STEP="$2"
+        shift 2
+      else
+        echo "cclimits: --step requires a number" >&2
+        exit 1
+      fi
+      ;;
+    --critical)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        CRITICAL_AT="$2"
+        shift 2
+      else
+        echo "cclimits: --critical requires a number" >&2
+        exit 1
+      fi
+      ;;
+    --no-alert)
+      ALERT_ENABLED=false
+      shift
+      ;;
+    --test)
+      osascript -e 'display notification "Notifications are working." with title "cclimits: test" sound name "Sosumi"'
+      echo "cclimits: test notification sent (if nothing appeared, allow notifications for your terminal in System Settings → Notifications)"
+      exit 0
+      ;;
+    --reset)
+      rm -f "$STATE_FILE"
+      echo "cclimits: notification state cleared"
+      exit 0
+      ;;
+    -h|--help)
+      sed -n '2,17p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      echo "cclimits: unknown option '$1' (see --help)" >&2
+      exit 1
+      ;;
+  esac
+done
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+mkdir -p "$STATE_DIR"
+
+state_get() {
+  local key="$1" v=""
+  if [[ -f "$STATE_FILE" ]]; then
+    v=$(awk -F'\t' -v k="$key" '$1==k{print $2}' "$STATE_FILE" | tail -1)
+  fi
+  echo "${v:-0}"
+}
+
+state_set() {
+  local key="$1" val="$2" tmp="${STATE_FILE}.tmp.$$"
+  {
+    [[ -f "$STATE_FILE" ]] && awk -F'\t' -v k="$key" '$1!=k' "$STATE_FILE"
+    printf '%s\t%s\n' "$key" "$val"
+  } > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+# Map a percent to its notification level: 0 below START_AT, then STEP-sized
+# bands (60, 70, 80), then every 1% from CRITICAL_AT up. A notification fires
+# only when the level rises above the last one saved for that limit.
+notify_level() {
+  local pct="$1"
+  if (( pct < START_AT )); then
+    echo 0
+  elif (( pct < CRITICAL_AT )); then
+    local band=$(( pct / STEP * STEP ))
+    (( band < START_AT )) && band=$START_AT
+    echo "$band"
+  else
+    echo "$pct"
+  fi
+}
+
+# "2026-07-16T17:19:59.672659+00:00" -> epoch (BSD date needs +0000, no colon)
+iso_to_epoch() {
+  local iso="$1"
+  iso=$(echo "$iso" | sed -E 's/\.[0-9]+//; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+  date -j -f "%Y-%m-%dT%H:%M:%S%z" "$iso" +%s 2>/dev/null || echo 0
+}
+
+# Format an epoch as EDT (America/New_York) plus a human delta from now.
+format_reset() {
+  local epoch="$1"
+  local now delta hrs mins delta_str when_str
+  if (( epoch == 0 )); then
+    echo "unknown"
+    return
+  fi
+  now=$(date +%s)
+  delta=$(( epoch - now ))
+  (( delta < 0 )) && delta=0
+  hrs=$(( delta / 3600 ))
+  mins=$(( (delta % 3600) / 60 ))
+  if (( hrs > 0 )); then
+    delta_str=$(printf "%dh%02dm" "$hrs" "$mins")
+  else
+    delta_str=$(printf "%dm" "$mins")
+  fi
+  when_str=$(TZ="America/New_York" date -r "$epoch" "+%a %H:%M %Z")
+  echo "${when_str} (in ${delta_str})"
+}
+
+fire_alert() {
+  local label="$1" pct="$2" reset_epoch="$3"
+  local title="cclimits: Claude usage"
+  (( pct >= CRITICAL_AT )) && title="cclimits: Claude usage CRITICAL"
+  local when
+  when=$(TZ="America/New_York" date -r "$reset_epoch" "+%H:%M %Z" 2>/dev/null || echo "?")
+  if command -v afplay >/dev/null 2>&1; then
+    afplay /System/Library/Sounds/Sosumi.aiff >/dev/null 2>&1 &
+  fi
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"${label} at ${pct}% — resets ${when}\" with title \"${title}\" sound name \"Sosumi\"" >/dev/null 2>&1 || true
+  fi
+}
+
+fetch_usage() {
+  local token resp http
+  token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+    | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null) || true
+  if [[ -z "$token" ]]; then
+    echo "cclimits: no OAuth token in Keychain (item 'Claude Code-credentials') — is Claude Code logged in?" >&2
+    return 1
+  fi
+  resp=$(curl -s --max-time 15 -w $'\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20") || {
+    echo "cclimits: request failed (network?)" >&2
+    return 1
+  }
+  http="${resp##*$'\n'}"
+  USAGE_JSON="${resp%$'\n'*}"
+  if [[ "$http" == "401" ]]; then
+    echo "cclimits: token expired — run any Claude Code command (it refreshes the token), then retry" >&2
+    return 1
+  fi
+  if [[ "$http" != "200" ]] || ! echo "$USAGE_JSON" | jq -e '.limits' >/dev/null 2>&1; then
+    echo "cclimits: unexpected response (HTTP $http)" >&2
+    return 1
+  fi
+}
+
+print_limit() {
+  local label="$1" pct="$2" reset_epoch="$3"
+  local color="$GREEN" width=24 filled bar
+  (( pct >= START_AT )) && color="$YELLOW"
+  (( pct >= CRITICAL_AT )) && color="$RED"
+  filled=$(( pct * width / 100 ))
+  (( filled > width )) && filled=$width
+  bar=$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' $(( width - filled )) '' | tr ' ' '░')
+  printf "${BOLD}%-22s${RESET} ${color}%s %3d%%${RESET}  resets ${BOLD}%s${RESET}\n" \
+    "$label" "$bar" "$pct" "$(format_reset "$reset_epoch")"
+}
+
+show_status() {
+  fetch_usage || return 1
+
+  local now_str
+  now_str=$(TZ="America/New_York" date "+%Y-%m-%d %H:%M:%S %Z")
+  printf "${DIM}as of %s — alerts from %d%%, every %d%%, every 1%% from %d%%${RESET}\n" \
+    "$now_str" "$START_AT" "$STEP" "$CRITICAL_AT"
+
+  local kind group pct resets scope key label reset_epoch level prev
+  while IFS=$'\t' read -r kind group pct resets scope; do
+    key="$kind"
+    case "$kind" in
+      session)       label="Session (5h)" ;;
+      weekly_all)    label="Weekly (all models)" ;;
+      weekly_scoped) label="Weekly (${scope:-scoped})"; key="${kind}:${scope}" ;;
+      *)             label="$kind" ;;
+    esac
+
+    reset_epoch=$(iso_to_epoch "$resets")
+    print_limit "$label" "$pct" "$reset_epoch"
+
+    level=$(notify_level "$pct")
+    prev=$(state_get "$key")
+    if (( level > prev )); then
+      if $ALERT_ENABLED; then
+        fire_alert "$label" "$pct" "$reset_epoch"
+        printf "  ${RED}${BOLD}⚠ notified: %s at %d%%${RESET}\n" "$label" "$pct"
+      fi
+      state_set "$key" "$level"
+    elif (( level < prev )); then
+      # Usage dropped (window reset) — re-arm so the next climb notifies again.
+      state_set "$key" "$level"
+    fi
+  done < <(echo "$USAGE_JSON" | jq -r \
+    '.limits[] | [.kind, .group, ((.percent // 0) | floor), (.resets_at // ""), (.scope.model.display_name // "")] | @tsv')
+}
+
+if $WATCH; then
+  # Alternate screen buffer so refreshes never accumulate in iTerm scrollback;
+  # restore the primary screen on any exit, auto-stop after WATCH_MAX_SECONDS.
+  trap 'printf "\033[?1049l"' EXIT
+  printf '\033[?1049h'
+  watch_deadline=$(( $(date +%s) + WATCH_MAX_SECONDS ))
+  while true; do
+    printf '\033[H\033[2J'
+    show_status || true
+    if (( $(date +%s) >= watch_deadline )); then
+      printf "\n${DIM}auto-exited after %ds — re-run to keep watching${RESET}\n" "$WATCH_MAX_SECONDS"
+      break
+    fi
+    printf "\n${DIM}refreshing every %ds — Ctrl-C to stop${RESET}\n" "$WATCH_INTERVAL"
+    sleep "$WATCH_INTERVAL"
+  done
+else
+  show_status
+fi
