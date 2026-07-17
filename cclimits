@@ -8,6 +8,7 @@
 #   cclimits --step N            # below critical, notify every N% (default 10)
 #   cclimits --critical N        # from N% on, notify every 1% (default 90)
 #   cclimits --no-alert          # display only, never notify
+#   cclimits --retries N         # attempts on 429/5xx/network (default 4)
 #   cclimits --test              # fire a test macOS notification and exit
 #   cclimits --reset             # clear saved notification state
 #
@@ -25,6 +26,10 @@ START_AT=60
 STEP=10
 CRITICAL_AT=90
 ALERT_ENABLED=true
+FETCH_RETRIES=4          # total attempts on 429/5xx/network before giving up (1 = no retry)
+RETRY_BASE=2             # base backoff seconds; grows 2,4,8… with jitter, capped at RETRY_MAX
+RETRY_MAX=60             # cap on any single backoff sleep
+USAGE_URL="${CCLIMITS_URL:-https://api.anthropic.com/api/oauth/usage}"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits"
 STATE_FILE="$STATE_DIR/state"
@@ -70,6 +75,15 @@ while [[ $# -gt 0 ]]; do
       ALERT_ENABLED=false
       shift
       ;;
+    --retries)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]] && (( $2 >= 1 )); then
+        FETCH_RETRIES="$2"
+        shift 2
+      else
+        echo "cclimits: --retries requires a number >= 1" >&2
+        exit 1
+      fi
+      ;;
     --test)
       osascript -e 'display notification "Notifications are working." with title "cclimits: test" sound name "Sosumi"'
       echo "cclimits: test notification sent (if nothing appeared, allow notifications for your terminal in System Settings → Notifications)"
@@ -81,7 +95,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     -h|--help)
-      sed -n '2,17p' "$0" | sed 's/^# \?//'
+      sed -n '2,18p' "$0" | sed 's/^# \?//'
       exit 0
       ;;
     *)
@@ -176,30 +190,83 @@ fire_alert() {
   fi
 }
 
+# Seconds to wait before the next attempt: exponential (RETRY_BASE·2^(n-1),
+# capped at RETRY_MAX) with up to ~1s of jitter so repeated callers desync.
+# Honors a positive Retry-After header when it exceeds our own backoff; the
+# server here sends "retry-after: 0", which we correctly ignore in favor of
+# real backoff so we don't hot-loop.
+backoff_delay() {
+  local attempt="$1" retry_after="${2:-0}" delay jitter
+  delay=$(( RETRY_BASE << (attempt - 1) ))
+  (( delay > RETRY_MAX )) && delay=$RETRY_MAX
+  if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > delay )); then
+    delay=$retry_after
+    (( delay > RETRY_MAX )) && delay=$RETRY_MAX
+  fi
+  jitter=$(( RANDOM % 1000 ))
+  awk -v d="$delay" -v j="$jitter" 'BEGIN{ printf "%.2f", d + j/1000 }'
+}
+
 fetch_usage() {
-  local token resp http
+  local token resp http hdr attempt lbl retry_after delay
   token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
     | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null) || true
   if [[ -z "$token" ]]; then
     echo "cclimits: no OAuth token in Keychain (item 'Claude Code-credentials') — is Claude Code logged in?" >&2
     return 1
   fi
-  resp=$(curl -s --max-time 15 -w $'\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
-    -H "Authorization: Bearer $token" \
-    -H "anthropic-beta: oauth-2025-04-20") || {
-    echo "cclimits: request failed (network?)" >&2
-    return 1
-  }
-  http="${resp##*$'\n'}"
-  USAGE_JSON="${resp%$'\n'*}"
-  if [[ "$http" == "401" ]]; then
-    echo "cclimits: token expired — run any Claude Code command (it refreshes the token), then retry" >&2
-    return 1
-  fi
-  if [[ "$http" != "200" ]] || ! echo "$USAGE_JSON" | jq -e '.limits' >/dev/null 2>&1; then
-    echo "cclimits: unexpected response (HTTP $http)" >&2
-    return 1
-  fi
+
+  hdr="$STATE_DIR/.hdr.$$"
+  attempt=0
+  while :; do
+    attempt=$(( attempt + 1 ))
+    if resp=$(curl -s --max-time 15 -D "$hdr" -w $'\n%{http_code}' "$USAGE_URL" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20"); then
+      http="${resp##*$'\n'}"
+      USAGE_JSON="${resp%$'\n'*}"
+    else
+      http="000"          # curl itself failed (timeout / DNS / connection)
+      USAGE_JSON=""
+    fi
+
+    case "$http" in
+      200)
+        if echo "$USAGE_JSON" | jq -e '.limits' >/dev/null 2>&1; then
+          rm -f "$hdr"
+          return 0
+        fi
+        echo "cclimits: HTTP 200 but response had no .limits — unexpected payload" >&2
+        rm -f "$hdr"
+        return 1
+        ;;
+      401)
+        echo "cclimits: token expired — run any Claude Code command (it refreshes the token), then retry" >&2
+        rm -f "$hdr"
+        return 1
+        ;;
+      429|500|502|503|504|000)
+        lbl="HTTP $http"
+        [[ "$http" == "000" ]] && lbl="network error"
+        if (( attempt < FETCH_RETRIES )); then
+          retry_after=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2; exit}' "$hdr" 2>/dev/null)
+          delay=$(backoff_delay "$attempt" "$retry_after")
+          printf "${DIM}cclimits: %s — retry %d/%d in %ss…${RESET}\n" \
+            "$lbl" "$attempt" "$(( FETCH_RETRIES - 1 ))" "$delay" >&2
+          sleep "$delay"
+          continue
+        fi
+        echo "cclimits: still failing (${lbl}) after $attempt attempts — try again shortly" >&2
+        rm -f "$hdr"
+        return 1
+        ;;
+      *)
+        echo "cclimits: unexpected response (HTTP $http)" >&2
+        rm -f "$hdr"
+        return 1
+        ;;
+    esac
+  done
 }
 
 print_limit() {
