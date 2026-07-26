@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# vault-sync - commit and push Obsidian vaults on a timer, independent of Obsidian
+#
+# Usage:
+#   vault-sync                   # sync every discovered vault once
+#   vault-sync --dry-run         # report what would happen, change nothing
+#   vault-sync --vault PATH      # sync only this vault (repeatable)
+#   vault-sync --quiet           # log only, never post a notification
+#   vault-sync --verbose         # also log vaults that had nothing to do
+#   vault-sync install [N]       # install and load the launchd agent (default every 600s)
+#   vault-sync uninstall         # unload and remove the agent
+#   vault-sync status            # agent state, discovered vaults, recent outcomes
+#   vault-sync log [N]           # tail the log (default 40 lines)
+#
+# Replaces obsidian-git's auto commit-and-sync, which only runs while Obsidian is
+# open and inherits whatever PATH the GUI was launched with — so signed commits
+# die with "cannot run gpg" whenever gpg is not on that PATH, and the error only
+# ever appears as an in-app notice nobody is watching. This owns its environment,
+# runs whether or not Obsidian is running, and reports failures out loud.
+#
+# Vaults are discovered from Obsidian's own vault list and filtered to git repos
+# with a remote, so a new vault is picked up automatically. Override by listing
+# absolute paths (one per line) in ~/.config/vault-sync/vaults.
+
+set -euo pipefail
+
+# Own the environment. A launchd agent gets a minimal PATH, and git needs to find
+# gpg for signed commits; leaving this to inheritance is the bug this replaces.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# Pushing over ssh needs the agent socket, which a launchd job does not always carry.
+if [[ -z "${SSH_AUTH_SOCK:-}" ]] && command -v launchctl >/dev/null 2>&1; then
+  _sock="$(launchctl getenv SSH_AUTH_SOCK || true)"
+  [[ -n "$_sock" ]] && export SSH_AUTH_SOCK="$_sock"
+fi
+
+AGENT_LABEL="com.jfarcand.vault-sync"
+PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vault-sync"
+LOG_FILE="$STATE_DIR/vault-sync.log"
+LOCK_DIR="$STATE_DIR/lock"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/vault-sync/vaults"
+OBSIDIAN_JSON="$HOME/Library/Application Support/obsidian/obsidian.json"
+DEFAULT_INTERVAL=600
+LOG_MAX_BYTES=1048576
+STALE_LOCK_SECONDS=1800
+
+DRY_RUN=false
+QUIET=false
+VERBOSE=false
+EXPLICIT_VAULTS=()
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+  printf '%s\n' "$*"
+  return 0
+}
+
+notify() {
+  local title="$1" message="$2"
+  $QUIET && return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"${message}\" with title \"${title}\" sound name \"Sosumi\"" >/dev/null 2>&1 || true
+}
+
+rotate_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size
+  size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  (( size > LOG_MAX_BYTES )) && mv -f "$LOG_FILE" "${LOG_FILE}.1"
+  return 0
+}
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    # A previous run that died without cleanup must not wedge the timer forever.
+    local age
+    age=$(( $(date +%s) - $(stat -f%m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+    if (( age > STALE_LOCK_SECONDS )); then
+      log "removing stale lock (${age}s old)"
+      rm -rf "$LOCK_DIR"
+      mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+  return 0
+}
+
+discover_vaults() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    grep -vE '^\s*(#|$)' "$CONFIG_FILE" || true
+    return 0
+  fi
+  [[ -f "$OBSIDIAN_JSON" ]] || return 0
+  python3 - "$OBSIDIAN_JSON" <<'PY'
+import json, os, sys
+try:
+    vaults = json.load(open(sys.argv[1])).get("vaults", {})
+except Exception:
+    sys.exit(0)
+for v in vaults.values():
+    p = v.get("path", "")
+    if p and os.path.isdir(os.path.join(p, ".git")):
+        print(p)
+PY
+}
+
+# Returns 0 synced-or-idle, 1 failed, 2 needs a human.
+sync_vault() {
+  local vault="$1"
+  local name; name="$(basename "$vault")"
+
+  if ! git -C "$vault" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log "$name: SKIP not a git repo"
+    return 0
+  fi
+  if ! git -C "$vault" remote get-url origin >/dev/null 2>&1; then
+    log "$name: SKIP no origin remote"
+    return 0
+  fi
+  if ! git -C "$vault" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    log "$name: SKIP branch has no upstream"
+    return 0
+  fi
+
+  # A half-finished rebase/merge blocks every git write. Report it instead of
+  # piling on top — this is the state that silently froze dravr-vault for hours.
+  local gitdir; gitdir="$(git -C "$vault" rev-parse --git-dir)"
+  gitdir="$(cd "$vault" && cd "$gitdir" && pwd)"
+  if [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" || -f "$gitdir/MERGE_HEAD" || -f "$gitdir/CHERRY_PICK_HEAD" ]]; then
+    log "$name: BLOCKED rebase/merge in progress — resolve it by hand"
+    notify "vault-sync: $name blocked" "A rebase or merge is in progress. Sync is paused for this vault."
+    return 2
+  fi
+
+  local dirty=false
+  [[ -n "$(git -C "$vault" status --porcelain)" ]] && dirty=true
+
+  if $DRY_RUN; then
+    local behind ahead
+    git -C "$vault" fetch --quiet origin 2>/dev/null || true
+    behind=$(git -C "$vault" rev-list --count 'HEAD..@{upstream}' 2>/dev/null || echo 0)
+    ahead=$(git -C "$vault" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
+    log "$name: DRY-RUN dirty=$dirty behind=$behind ahead=$ahead"
+    return 0
+  fi
+
+  if $dirty; then
+    git -C "$vault" add -A
+    if ! git -C "$vault" diff --cached --quiet; then
+      if ! git -C "$vault" commit -q -m "vault: auto-save $(date '+%Y-%m-%d %H:%M:%S')" 2>>"$LOG_FILE"; then
+        log "$name: FAILED commit (see log; a signing or hook error is most likely)"
+        notify "vault-sync: $name failed" "Commit failed. Check vault-sync log."
+        return 1
+      fi
+    fi
+  fi
+
+  if ! git -C "$vault" fetch --quiet origin 2>>"$LOG_FILE"; then
+    log "$name: FAILED fetch (network or ssh auth)"
+    notify "vault-sync: $name failed" "Could not reach origin."
+    return 1
+  fi
+
+  local behind ahead
+  behind=$(git -C "$vault" rev-list --count 'HEAD..@{upstream}')
+  ahead=$(git -C "$vault" rev-list --count '@{upstream}..HEAD')
+
+  if (( behind > 0 )); then
+    # Abort a conflicted merge rather than leaving the repo unusable until noticed.
+    if ! git -C "$vault" merge --no-edit -q '@{upstream}' >>"$LOG_FILE" 2>&1; then
+      git -C "$vault" merge --abort 2>/dev/null || true
+      log "$name: CONFLICT merging origin — merged nothing, resolve by hand"
+      notify "vault-sync: $name conflict" "Incoming changes conflict with local edits. Resolve by hand."
+      return 2
+    fi
+    ahead=$(git -C "$vault" rev-list --count '@{upstream}..HEAD')
+  fi
+
+  if (( ahead > 0 )); then
+    if ! git -C "$vault" push -q origin HEAD 2>>"$LOG_FILE"; then
+      log "$name: FAILED push"
+      notify "vault-sync: $name failed" "Push to origin failed."
+      return 1
+    fi
+    log "$name: pushed $ahead commit(s)"
+  elif (( behind > 0 )); then
+    log "$name: pulled $behind commit(s)"
+  elif $VERBOSE; then
+    log "$name: nothing to do"
+  fi
+  return 0
+}
+
+run_sync() {
+  rotate_log
+  if ! acquire_lock; then
+    log "another vault-sync run is in progress, skipping"
+    return 0
+  fi
+
+  local vaults=()
+  if (( ${#EXPLICIT_VAULTS[@]} > 0 )); then
+    vaults=("${EXPLICIT_VAULTS[@]}")
+  else
+    while IFS= read -r line; do [[ -n "$line" ]] && vaults+=("$line"); done < <(discover_vaults)
+  fi
+
+  if (( ${#vaults[@]} == 0 )); then
+    log "no vaults discovered"
+    return 0
+  fi
+
+  local failed=0 blocked=0
+  for v in "${vaults[@]}"; do
+    set +e
+    sync_vault "$v"
+    local rc=$?
+    set -e
+    (( rc == 1 )) && failed=$((failed + 1))
+    (( rc == 2 )) && blocked=$((blocked + 1))
+  done
+
+  (( failed > 0 || blocked > 0 )) && return 1
+  return 0
+}
+
+install_agent() {
+  local interval="${1:-$DEFAULT_INTERVAL}"
+  mkdir -p "$(dirname "$PLIST")" "$STATE_DIR"
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${SCRIPT_PATH}</string>
+  </array>
+  <key>StartInterval</key><integer>${interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${STATE_DIR}/launchd.out</string>
+  <key>StandardErrorPath</key><string>${STATE_DIR}/launchd.err</string>
+</dict>
+</plist>
+PLISTEOF
+  launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed ${AGENT_LABEL}, every ${interval}s -> ${SCRIPT_PATH}"
+  echo "log: ${LOG_FILE}"
+}
+
+uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "removed ${AGENT_LABEL}"
+}
+
+show_status() {
+  if launchctl print "gui/$(id -u)/${AGENT_LABEL}" >/dev/null 2>&1; then
+    local interval
+    interval=$(/usr/libexec/PlistBuddy -c "Print :StartInterval" "$PLIST" 2>/dev/null || echo "?")
+    echo "agent: loaded (every ${interval}s)"
+  else
+    echo "agent: not loaded  (run: vault-sync install)"
+  fi
+  echo "vaults:"
+  local found=false
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    found=true
+    local ahead dirty
+    dirty=$(git -C "$v" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    ahead=$(git -C "$v" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo '?')
+    printf '  %-20s %s uncommitted, %s unpushed\n' "$(basename "$v")" "$dirty" "$ahead"
+  done < <(discover_vaults)
+  $found || echo "  (none discovered)"
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "recent:"
+    tail -8 "$LOG_FILE" | sed 's/^/  /'
+  fi
+}
+
+case "${1:-}" in
+  install)   shift; install_agent "${1:-$DEFAULT_INTERVAL}"; exit 0 ;;
+  uninstall) uninstall_agent; exit 0 ;;
+  status)    show_status; exit 0 ;;
+  log)       shift; tail -"${1:-40}" "$LOG_FILE" 2>/dev/null || echo "no log yet"; exit 0 ;;
+  -h|--help) sed -n '2,24p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --quiet)   QUIET=true; shift ;;
+    --verbose) VERBOSE=true; shift ;;
+    --vault)
+      if [[ -z "${2:-}" ]]; then echo "vault-sync: --vault requires a path" >&2; exit 1; fi
+      EXPLICIT_VAULTS+=("$2"); shift 2 ;;
+    *) echo "vault-sync: unknown option $1 (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+run_sync
