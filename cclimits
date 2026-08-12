@@ -21,7 +21,7 @@ set -euo pipefail
 
 WATCH=false
 WATCH_INTERVAL=60
-WATCH_MAX_SECONDS=21600   # auto-exit watch after 6h so a forgotten loop can't linger
+ONESHOT_MAX_SECONDS=21600 # one-shot retry ceiling (6h): a stuck endpoint can't hang a cron run forever
 START_AT=60
 STEP=10
 CRITICAL_AT=90
@@ -256,11 +256,11 @@ fetch_usage() {
         fi
         retry_after=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2; exit}' "$hdr" 2>/dev/null)
         delay=$(backoff_delay "$attempt" "$retry_after")
-        # Never retry past the shared run ceiling: even "retry forever" stays
-        # bounded by WATCH_MAX_SECONDS so a stuck endpoint can't linger (guards
-        # the iTerm working-set freeze the same way the watch auto-exit does).
-        if (( $(date +%s) + ${delay%.*} >= RUN_DEADLINE )); then
-          echo "cclimits: still failing (${lbl}) after ${attempt} attempts / ~$(( WATCH_MAX_SECONDS / 3600 ))h ceiling — giving up" >&2
+        # One-shot runs (RUN_DEADLINE>0) stop retrying at the ceiling so a stuck
+        # endpoint can't hang a cron job. Watch mode sets RUN_DEADLINE=0 (retry
+        # until it clears) since the process is meant to persist until Ctrl-C.
+        if (( RUN_DEADLINE > 0 && $(date +%s) + ${delay%.*} >= RUN_DEADLINE )); then
+          echo "cclimits: still failing (${lbl}) after ${attempt} attempts / ~$(( ONESHOT_MAX_SECONDS / 3600 ))h ceiling — giving up" >&2
           rm -f "$hdr"
           return 1
         fi
@@ -332,27 +332,24 @@ show_status() {
     '.limits[] | [.kind, .group, ((.percent // 0) | floor), (.resets_at // ""), (.scope.model.display_name // "")] | @tsv')
 }
 
-# Absolute wall-clock ceiling shared by the watch loop and the fetch retry loop.
-# Nothing this invocation does outlives WATCH_MAX_SECONDS — a forgotten watch OR
-# an endless retry against a stuck endpoint both stop here (iTerm freeze guard).
-RUN_DEADLINE=$(( $(date +%s) + WATCH_MAX_SECONDS ))
-
 if $WATCH; then
-  # Alternate screen buffer so refreshes never accumulate in iTerm scrollback;
-  # restore the primary screen on any exit, auto-stop after WATCH_MAX_SECONDS.
+  # Runs until Ctrl-C, like watch(1)/tail -f — no time cap. Memory stays flat
+  # because we render into the alternate screen buffer, so nothing accumulates
+  # in scrollback (that alt-screen rendering, not a timer, is the real guard
+  # against the iTerm working-set freeze). RUN_DEADLINE=0 = retries never hit a
+  # ceiling either, since the process is meant to persist.
+  RUN_DEADLINE=0
   trap 'printf "\033[?1049l"' EXIT
   printf '\033[?1049h'
-  watch_deadline=$RUN_DEADLINE
   while true; do
     printf '\033[H\033[2J'
     show_status || true
-    if (( $(date +%s) >= watch_deadline )); then
-      printf "\n${DIM}auto-exited after %ds — re-run to keep watching${RESET}\n" "$WATCH_MAX_SECONDS"
-      break
-    fi
     printf "\n${DIM}refreshing every %ds — Ctrl-C to stop${RESET}\n" "$WATCH_INTERVAL"
     sleep "$WATCH_INTERVAL"
   done
 else
+  # One-shot (cron/launchd): retry until it clears, bounded by ONESHOT_MAX_SECONDS
+  # so a stuck endpoint can't hang the run indefinitely.
+  RUN_DEADLINE=$(( $(date +%s) + ONESHOT_MAX_SECONDS ))
   show_status
 fi
