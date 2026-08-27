@@ -2,20 +2,32 @@
 # cclimits - Claude Code usage limits (session + weekly) with macOS notifications
 #
 # Usage:
-#   cclimits                     # show usage once (and notify if a threshold was crossed)
+#   cclimits                     # show usage once for every logged-in account
 #   cclimits -w [SECONDS]        # watch mode, refresh every N seconds (default 60)
+#   cclimits -a NAME[,NAME…]     # only accounts matching NAME (config dir name or email)
+#   cclimits --accounts          # list the accounts cclimits can see, then exit
+#   cclimits --width N           # force layout width (default: terminal width)
 #   cclimits --start N           # notifications start at N% (default 60)
 #   cclimits --step N            # below critical, notify every N% (default 10)
 #   cclimits --critical N        # from N% on, notify every 1% (default 90)
 #   cclimits --no-alert          # display only, never notify
 #   cclimits --retries N         # cap attempts on 429/5xx/network (default 0 = retry until it clears)
 #   cclimits --test              # fire a test macOS notification and exit
-#   cclimits --reset             # clear saved notification state
+#   cclimits --reset             # clear saved notification state and cached usage
 #
-# Reads the Claude Code OAuth token from the macOS Keychain and calls the same
-# usage endpoint the /usage command uses (does not consume usage). Notification
-# state persists in ~/.local/state/cclimits so one-shot runs (cron/launchd) and
-# watch mode both avoid re-notifying for the same threshold.
+# Accounts are auto-discovered: ~/.claude plus every ~/.claude-* config dir that
+# has Keychain credentials (Claude Code stores them under
+# "Claude Code-credentials" for the default dir and
+# "Claude Code-credentials-<sha256(abs dir path)[0:8]>" for a CLAUDE_CONFIG_DIR).
+# Each account gets its own column. Override discovery with
+# CCLIMITS_ACCOUNTS="name=/path,name=/path".
+#
+# Calls the same usage endpoint the /usage command uses (does not consume usage).
+# That endpoint rate-limits hard: a 429 can carry a Retry-After of ~30 minutes.
+# The last good numbers are cached per account in ~/.local/state/cclimits/cache
+# and shown dimmed as "(stale Nm)" while an account is locked out.
+# Notification state is per account in ~/.local/state/cclimits, so one-shot runs
+# (cron/launchd) and watch mode both avoid re-notifying for the same threshold.
 
 set -euo pipefail
 
@@ -29,10 +41,27 @@ ALERT_ENABLED=true
 FETCH_RETRIES=0          # 0 = retry until it clears (truncated backoff); N>=1 caps total attempts
 RETRY_BASE=2             # base backoff seconds; grows 2,4,8… with jitter, capped at RETRY_MAX
 RETRY_MAX=60             # cap on any single backoff sleep (so it plateaus, doesn't grow unbounded)
+COOLDOWN_MAX=1800        # cap on how long a server Retry-After may silence one account (30m)
+RETRY_AFTER_WAIT_MAX=120 # longest server-stated Retry-After worth blocking on; past it we bail and cache
+CACHE_MAX_AGE=21600      # stop showing last-good numbers once they are this old (6h)
+FETCH_RETRY_AFTER=0      # seconds a 429 asked us to wait; set by fetch_usage
+FORCE_WIDTH=0
+ACCOUNT_FILTER=""
+LIST_ACCOUNTS=false
 USAGE_URL="${CCLIMITS_URL:-https://api.anthropic.com/api/oauth/usage}"
+PRIMARY_DIR="$HOME/.claude"
+
+LABEL_W=21               # width of the shared row-label column in multi-account layout
+GAP=4                    # minimum spaces between account columns
+GAP_BONUS=12             # extra gap a wide window may absorb, so columns spread out
+BAR_MIN=8                # narrowest bar worth drawing before falling back to stacked
+BAR_MAX=40               # widest bar, so a very wide window does not turn into one long bar
+RESET_W_FULL=20          # "Sun 19:59 in 121h30m" — reset text when there is room
+RESET_W_SHORT=10         # "in 121h30m" — reset text when columns are tight
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits"
 STATE_FILE="$STATE_DIR/state"
+CACHE_DIR="$STATE_DIR/cache"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,6 +72,28 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       shift
+      ;;
+    -a|--account)
+      if [[ -n "${2:-}" ]]; then
+        ACCOUNT_FILTER="$2"
+        shift 2
+      else
+        echo "cclimits: --account requires a name (see --accounts)" >&2
+        exit 1
+      fi
+      ;;
+    --accounts)
+      LIST_ACCOUNTS=true
+      shift
+      ;;
+    --width)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        FORCE_WIDTH="$2"
+        shift 2
+      else
+        echo "cclimits: --width requires a number" >&2
+        exit 1
+      fi
       ;;
     --start)
       if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
@@ -91,11 +142,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --reset)
       rm -f "$STATE_FILE"
-      echo "cclimits: notification state cleared"
+      rm -rf "$CACHE_DIR"
+      echo "cclimits: notification state and cached usage cleared"
       exit 0
       ;;
     -h|--help)
-      sed -n '2,18p' "$0" | sed 's/^# \?//'
+      sed -n '2,27p' "$0" | sed 's/^#//; s/^ //'
       exit 0
       ;;
     *)
@@ -112,7 +164,17 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$CACHE_DIR"
+
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cclimits.XXXXXX")
+ALT_SCREEN=false
+cleanup() {
+  $ALT_SCREEN && printf '\033[?1049l'
+  rm -rf "$RUN_DIR"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- state ------
 
 state_get() {
   local key="$1" v=""
@@ -131,6 +193,17 @@ state_set() {
   mv "$tmp" "$STATE_FILE"
 }
 
+# Keys used to be bare ("session", "weekly_scoped:Fable") back when cclimits knew
+# one account. Prefix those with the primary account so the pre-multi-account
+# thresholds carry over instead of re-notifying from scratch.
+state_migrate() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  local prefix tmp="${STATE_FILE}.tmp.$$"
+  prefix=$(basename "$PRIMARY_DIR"); prefix="${prefix#.}"
+  awk -F'\t' -v p="$prefix" 'BEGIN{OFS="\t"} NF>=2 { if ($1 !~ /\//) $1 = p "/" $1; print }' \
+    "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
 # Map a percent to its notification level: 0 below START_AT, then STEP-sized
 # bands (60, 70, 80), then every 1% from CRITICAL_AT up. A notification fires
 # only when the level rises above the last one saved for that limit.
@@ -147,39 +220,221 @@ notify_level() {
   fi
 }
 
+# ------------------------------------------------------------- accounts ------
+
+# Claude Code namespaces Keychain credentials by config dir: the default
+# ~/.claude uses "Claude Code-credentials", any other CLAUDE_CONFIG_DIR uses
+# "Claude Code-credentials-<first 8 hex of sha256(absolute path)>".
+keychain_service_for_dir() {
+  local dir="${1%/}" hash svc
+  hash=$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)
+  svc="Claude Code-credentials-$hash"
+  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    echo "$svc"
+    return 0
+  fi
+  if [[ "$dir" == "${PRIMARY_DIR%/}" ]] && security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+    echo "Claude Code-credentials"
+    return 0
+  fi
+  return 1
+}
+
+# The default config dir keeps its account file beside it (~/.claude.json);
+# a CLAUDE_CONFIG_DIR keeps it inside (<dir>/.claude.json).
+account_email() {
+  local dir="${1%/}" f
+  for f in "$dir/.claude.json" "$HOME/.claude.json"; do
+    if [[ "$f" == "$HOME/.claude.json" && "$dir" != "${PRIMARY_DIR%/}" ]]; then
+      continue
+    fi
+    if [[ -f "$f" ]]; then
+      jq -r '.oauthAccount.emailAddress // empty' "$f" 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+
+# name<TAB>dir<TAB>keychain-service<TAB>email, one per logged-in config dir.
+# Dirs without credentials (stale copies, half-made dirs) are skipped silently.
+discover_accounts() {
+  local entries=() n=0 dir name svc email spec
+  if [[ -n "${CCLIMITS_ACCOUNTS:-}" ]]; then
+    local IFS=$',\n '
+    for spec in $CCLIMITS_ACCOUNTS; do
+      [[ -n "$spec" ]] || continue
+      entries[$n]="$spec"; n=$(( n + 1 ))
+    done
+  else
+    entries[$n]="$PRIMARY_DIR"; n=$(( n + 1 ))
+    for dir in "$HOME"/.claude-*; do
+      [[ -d "$dir" ]] || continue
+      entries[$n]="$dir"; n=$(( n + 1 ))
+    done
+  fi
+
+  local i=0
+  while (( i < n )); do
+    spec="${entries[$i]}"
+    i=$(( i + 1 ))
+    if [[ "$spec" == *=* ]]; then
+      name="${spec%%=*}"
+      dir="${spec#*=}"
+    else
+      dir="$spec"
+      name=$(basename "$dir"); name="${name#.}"
+    fi
+    dir="${dir/#\~/$HOME}"
+    [[ -d "$dir" ]] || continue
+    svc=$(keychain_service_for_dir "$dir") || continue
+    email=$(account_email "$dir")
+    printf '%s\t%s\t%s\t%s\n' "$name" "$dir" "$svc" "$email"
+  done
+}
+
+matches_filter() {
+  local name="$1" email="$2" pat lc_name lc_email
+  lc_name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+  lc_email=$(echo "$email" | tr '[:upper:]' '[:lower:]')
+  local IFS=','
+  for pat in $ACCOUNT_FILTER; do
+    pat=$(echo "$pat" | tr '[:upper:]' '[:lower:]')
+    [[ -z "$pat" ]] && continue
+    [[ "$lc_name" == *"$pat"* || "$lc_email" == *"$pat"* ]] && return 0
+  done
+  return 1
+}
+
+ACC_NAME=(); ACC_DIR=(); ACC_SVC=(); ACC_EMAIL=(); ACC_COUNT=0
+ACC_SRC=(); ACC_STALE=()
+
+load_accounts() {
+  local name dir svc email
+  while IFS=$'\t' read -r name dir svc email; do
+    [[ -n "$name" ]] || continue
+    if [[ -n "$ACCOUNT_FILTER" ]] && ! matches_filter "$name" "$email"; then
+      continue
+    fi
+    ACC_NAME[$ACC_COUNT]="$name"
+    ACC_DIR[$ACC_COUNT]="$dir"
+    ACC_SVC[$ACC_COUNT]="$svc"
+    ACC_EMAIL[$ACC_COUNT]="$email"
+    ACC_COUNT=$(( ACC_COUNT + 1 ))
+  done < <(discover_accounts)
+}
+
+# ------------------------------------------------------------ formatting -----
+
 # "2026-07-16T17:19:59.672659+00:00" -> epoch (BSD date needs +0000, no colon)
 iso_to_epoch() {
   local iso="$1"
+  [[ -n "$iso" ]] || { echo 0; return; }
   iso=$(echo "$iso" | sed -E 's/\.[0-9]+//; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
   date -j -f "%Y-%m-%dT%H:%M:%S%z" "$iso" +%s 2>/dev/null || echo 0
+}
+
+# seconds -> "1h22m" / "45m" / "37s"
+human_secs() {
+  local delta="$1" hrs mins
+  (( delta < 0 )) && delta=0
+  hrs=$(( delta / 3600 ))
+  mins=$(( (delta % 3600) / 60 ))
+  if (( hrs > 0 )); then
+    printf "%dh%02dm" "$hrs" "$mins"
+  elif (( mins > 0 )); then
+    printf "%dm" "$mins"
+  else
+    printf "%ds" "$delta"
+  fi
+}
+
+delta_str() {
+  human_secs $(( $1 - $(date +%s) ))
 }
 
 # Format an epoch as EDT (America/New_York) plus a human delta from now.
 format_reset() {
   local epoch="$1"
-  local now delta hrs mins delta_str when_str
   if (( epoch == 0 )); then
     echo "unknown"
     return
   fi
-  now=$(date +%s)
-  delta=$(( epoch - now ))
-  (( delta < 0 )) && delta=0
-  hrs=$(( delta / 3600 ))
-  mins=$(( (delta % 3600) / 60 ))
-  if (( hrs > 0 )); then
-    delta_str=$(printf "%dh%02dm" "$hrs" "$mins")
-  else
-    delta_str=$(printf "%dm" "$mins")
-  fi
-  when_str=$(TZ="America/New_York" date -r "$epoch" "+%a %H:%M %Z")
-  echo "${when_str} (in ${delta_str})"
+  echo "$(TZ="America/New_York" date -r "$epoch" "+%a %H:%M %Z") (in $(delta_str "$epoch"))"
 }
 
+# Same information, narrow enough to sit in a column: "Tue 19:40 in 1h22m".
+format_reset_compact() {
+  local epoch="$1"
+  if (( epoch == 0 )); then
+    echo "no reset"
+    return
+  fi
+  echo "$(TZ="America/New_York" date -r "$epoch" "+%a %H:%M") in $(delta_str "$epoch")"
+}
+
+# Delta only, for columns too tight to carry the wall-clock time.
+format_reset_short() {
+  local epoch="$1"
+  if (( epoch == 0 )); then
+    echo "no reset"
+    return
+  fi
+  echo "in $(delta_str "$epoch")"
+}
+
+# " · stale 4m" for a column showing cached numbers, empty when fresh.
+stale_note() {
+  local stamp="$1" now
+  (( stamp > 0 )) || return 0
+  now=$(date +%s)
+  printf ' (stale %s)' "$(human_secs $(( now - stamp )))"
+}
+
+pct_color() {
+  local pct="$1"
+  if (( pct >= CRITICAL_AT )); then echo "$RED"
+  elif (( pct >= START_AT )); then echo "$YELLOW"
+  else echo "$GREEN"; fi
+}
+
+make_bar() {
+  local pct="$1" width="$2" filled
+  filled=$(( pct * width / 100 ))
+  (( filled > width )) && filled=$width
+  (( filled < 0 )) && filled=0
+  printf '%s%s' \
+    "$(printf '%*s' "$filled" '' | tr ' ' '█')" \
+    "$(printf '%*s' $(( width - filled )) '' | tr ' ' '░')"
+}
+
+# `tput cols` reads the size from ITS OWN stdout, which is a pipe inside $( ),
+# so it reports terminfo's default (80) however wide the window really is. Ask
+# the controlling tty directly; tput/COLUMNS are only fallbacks (cron has no tty).
+term_width() {
+  local w=""
+  if (( FORCE_WIDTH > 0 )); then
+    echo "$FORCE_WIDTH"
+    return
+  fi
+  # the group keeps bash's own "/dev/tty: Device not configured" (cron, launchd)
+  # off stderr — redirecting stty alone doesn't silence a failed redirection
+  w=$( { stty size </dev/tty | awk '{print $2}'; } 2>/dev/null ) || w=""
+  if ! [[ "$w" =~ ^[0-9]+$ ]] || (( w <= 0 )); then
+    w=$(tput cols 2>/dev/null) || w=""
+  fi
+  if ! [[ "$w" =~ ^[0-9]+$ ]] || (( w <= 0 )); then
+    w="${COLUMNS:-100}"
+  fi
+  [[ "$w" =~ ^[0-9]+$ ]] && (( w > 0 )) || w=100
+  echo "$w"
+}
+
+# ---------------------------------------------------------------- fetch ------
+
 fire_alert() {
-  local label="$1" pct="$2" reset_epoch="$3"
-  local title="cclimits: Claude usage"
-  (( pct >= CRITICAL_AT )) && title="cclimits: Claude usage CRITICAL"
+  local account="$1" label="$2" pct="$3" reset_epoch="$4"
+  local title="cclimits: $account usage"
+  (( pct >= CRITICAL_AT )) && title="cclimits: $account usage CRITICAL"
   local when
   when=$(TZ="America/New_York" date -r "$reset_epoch" "+%H:%M %Z" 2>/dev/null || echo "?")
   if command -v afplay >/dev/null 2>&1; then
@@ -192,31 +447,39 @@ fire_alert() {
 
 # Seconds to wait before the next attempt: exponential (RETRY_BASE·2^(n-1),
 # capped at RETRY_MAX) with up to ~1s of jitter so repeated callers desync.
-# Honors a positive Retry-After header when it exceeds our own backoff; the
-# server here sends "retry-after: 0", which we correctly ignore in favor of
-# real backoff so we don't hot-loop.
+# A positive Retry-After wins when it exceeds our own backoff, and is NOT capped:
+# it is the server saying exactly when to come back (this endpoint hands out
+# ~1700s lockouts), so the caller's deadline decides whether to wait it out or
+# give up. It also sends "retry-after: 0", which loses to our own backoff.
 backoff_delay() {
   local attempt="$1" retry_after="${2:-0}" delay jitter
   delay=$(( RETRY_BASE << (attempt - 1) ))
   (( delay > RETRY_MAX )) && delay=$RETRY_MAX
   if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > delay )); then
     delay=$retry_after
-    (( delay > RETRY_MAX )) && delay=$RETRY_MAX
   fi
   jitter=$(( RANDOM % 1000 ))
   awk -v d="$delay" -v j="$jitter" 'BEGIN{ printf "%.2f", d + j/1000 }'
 }
 
+# fetch_usage <keychain-service> <account-name> <deadline-epoch|0>
+# Sets USAGE_JSON on success, FETCH_ERR on failure. The deadline bounds one
+# account's retrying so a throttled account can't starve the others.
 fetch_usage() {
+  local svc="$1" who="$2" deadline="$3"
   local token resp http hdr attempt lbl retry_after delay
-  token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+  FETCH_ERR=""
+  USAGE_JSON=""
+  FETCH_RETRY_AFTER=0     # seconds the server asked us to wait, 0 when it didn't
+
+  token=$(security find-generic-password -s "$svc" -w 2>/dev/null \
     | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null) || true
   if [[ -z "$token" ]]; then
-    echo "cclimits: no OAuth token in Keychain (item 'Claude Code-credentials') — is Claude Code logged in?" >&2
+    FETCH_ERR="no OAuth token in Keychain (item '$svc') — is this account logged in?"
     return 1
   fi
 
-  hdr="$STATE_DIR/.hdr.$$"
+  hdr="$RUN_DIR/hdr.$$"
   attempt=0
   while :; do
     attempt=$(( attempt + 1 ))
@@ -236,12 +499,12 @@ fetch_usage() {
           rm -f "$hdr"
           return 0
         fi
-        echo "cclimits: HTTP 200 but response had no .limits — unexpected payload" >&2
+        FETCH_ERR="HTTP 200 but response had no .limits — unexpected payload"
         rm -f "$hdr"
         return 1
         ;;
       401)
-        echo "cclimits: token expired — run any Claude Code command (it refreshes the token), then retry" >&2
+        FETCH_ERR="token expired — run any '$who' command (it refreshes the token), then retry"
         rm -f "$hdr"
         return 1
         ;;
@@ -250,32 +513,49 @@ fetch_usage() {
         [[ "$http" == "000" ]] && lbl="network error"
         # Optional hard cap on attempts (--retries N, N>0). Default 0 = keep going.
         if (( FETCH_RETRIES > 0 && attempt >= FETCH_RETRIES )); then
-          echo "cclimits: still failing (${lbl}) after $attempt attempts — try again shortly" >&2
+          FETCH_ERR="still failing (${lbl}) after $attempt attempts"
           rm -f "$hdr"
           return 1
         fi
         retry_after=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2; exit}' "$hdr" 2>/dev/null)
+        if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > 0 )); then
+          FETCH_RETRY_AFTER=$retry_after
+        fi
+        # A multi-minute lockout is not worth blocking on: bail now so the caller
+        # can show cached numbers, and come back once the cooldown has expired.
+        if (( FETCH_RETRY_AFTER > RETRY_AFTER_WAIT_MAX )); then
+          FETCH_ERR="rate limited — the server asked for $(human_secs "$FETCH_RETRY_AFTER")"
+          rm -f "$hdr"
+          return 1
+        fi
         delay=$(backoff_delay "$attempt" "$retry_after")
-        # One-shot runs (RUN_DEADLINE>0) stop retrying at the ceiling so a stuck
-        # endpoint can't hang a cron job. Watch mode sets RUN_DEADLINE=0 (retry
-        # until it clears) since the process is meant to persist until Ctrl-C.
-        if (( RUN_DEADLINE > 0 && $(date +%s) + ${delay%.*} >= RUN_DEADLINE )); then
-          echo "cclimits: still failing (${lbl}) after ${attempt} attempts / ~$(( ONESHOT_MAX_SECONDS / 3600 ))h ceiling — giving up" >&2
+        # Watch mode gives each account a slice of the refresh interval, so a
+        # throttled account still renders (and retries on the next cycle) instead
+        # of blocking the others. One-shot runs (cron/launchd) split the 6h
+        # ceiling, so a stuck endpoint can't hang the run forever.
+        if (( deadline > 0 && $(date +%s) + ${delay%.*} >= deadline )); then
+          if (( FETCH_RETRY_AFTER > 0 )); then
+            FETCH_ERR="rate limited — the server asked for $(human_secs "$FETCH_RETRY_AFTER"), longer than this refresh"
+          elif $WATCH; then
+            FETCH_ERR="${lbl} after ${attempt} attempts — retrying at the next refresh"
+          else
+            FETCH_ERR="${lbl} — gave up after ${attempt} attempts"
+          fi
           rm -f "$hdr"
           return 1
         fi
         if (( FETCH_RETRIES > 0 )); then
-          printf "${DIM}cclimits: %s — retry %d/%d in %ss…${RESET}\n" \
-            "$lbl" "$attempt" "$(( FETCH_RETRIES - 1 ))" "$delay" >&2
+          printf "${DIM}cclimits[%s]: %s — retry %d/%d in %ss…${RESET}\n" \
+            "$who" "$lbl" "$attempt" "$(( FETCH_RETRIES - 1 ))" "$delay" >&2
         else
-          printf "${DIM}cclimits: %s — retry #%d in %ss (until it clears)…${RESET}\n" \
-            "$lbl" "$attempt" "$delay" >&2
+          printf "${DIM}cclimits[%s]: %s — retry #%d in %ss…${RESET}\n" \
+            "$who" "$lbl" "$attempt" "$delay" >&2
         fi
         sleep "$delay"
         continue
         ;;
       *)
-        echo "cclimits: unexpected response (HTTP $http)" >&2
+        FETCH_ERR="unexpected response (HTTP $http)"
         rm -f "$hdr"
         return 1
         ;;
@@ -283,63 +563,340 @@ fetch_usage() {
   done
 }
 
+# sort-order<TAB>state-key<TAB>label<TAB>percent<TAB>reset-epoch
+rows_from_json() {
+  local kind pct resets scope order key label
+  # "-" placeholders: tab is IFS whitespace, so `read` would collapse the two
+  # tabs around an empty field (a scoped weekly with resets_at: null) and shift
+  # every later field left.
+  echo "$1" | jq -r \
+    '.limits[] | [.kind, ((.percent // 0) | floor), (.resets_at // "-" | if . == "" then "-" else . end), (.scope.model.display_name // "-" | if . == "" then "-" else . end)] | @tsv' \
+  | while IFS=$'\t' read -r kind pct resets scope; do
+      [[ "$resets" == "-" ]] && resets=""
+      [[ "$scope" == "-" ]] && scope=""
+      case "$kind" in
+        session)       order=1; key="session";                 label="Session (5h)" ;;
+        weekly_all)    order=2; key="weekly_all";              label="Weekly (all models)" ;;
+        weekly_scoped) order=3; key="weekly_scoped:${scope}";  label="Weekly (${scope:-scoped})" ;;
+        *)             order=4; key="$kind";                   label="$kind" ;;
+      esac
+      printf '%s\t%s\t%s\t%s\t%s\n' "$order" "$key" "$label" "$pct" "$(iso_to_epoch "$resets")"
+    done
+}
+
+# Cache and cooldown live under STATE_DIR, not the run's temp dir, so the last
+# good numbers survive a restart — which is the whole point when the endpoint
+# locks an account out for half an hour.
+cache_base() {
+  printf '%s/%s' "$CACHE_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# Fall back to account i's last good rows, unless they are old enough to mislead.
+use_cache() {
+  local i="$1" base="$2" now="$3" stamp
+  stamp=$(cat "$base.stamp" 2>/dev/null || echo 0)
+  [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+  if [[ -s "$base.rows" ]] && (( stamp > 0 )) && (( now - stamp < CACHE_MAX_AGE )); then
+    ACC_SRC[$i]="$base.rows"
+    ACC_STALE[$i]=$stamp
+  else
+    ACC_SRC[$i]=""
+    ACC_STALE[$i]=-1
+  fi
+  return 0
+}
+
+# ACC_SRC[i] is the file to render from: this cycle's rows, or the last good
+# ones when the fetch failed. ACC_STALE[i] is 0 for fresh, the epoch the cached
+# rows were fetched at when stale, and -1 when there is nothing to show at all.
+collect_all() {
+  local i=0 budget now base cooldown left
+  if $WATCH; then
+    budget=$(( WATCH_INTERVAL / ACC_COUNT ))
+    (( budget < 15 )) && budget=15
+  else
+    budget=$(( ONESHOT_MAX_SECONDS / ACC_COUNT ))
+  fi
+  while (( i < ACC_COUNT )); do
+    rm -f "$RUN_DIR/rows.$i" "$RUN_DIR/err.$i"
+    : > "$RUN_DIR/rows.$i"
+    now=$(date +%s)
+    base=$(cache_base "${ACC_NAME[$i]}")
+    cooldown=$(cat "$base.cooldown" 2>/dev/null || echo 0)
+    [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=0
+    if (( cooldown > now )); then
+      # The server named the minute to come back; polling before then just
+      # collects more 429s (and can extend the lockout), so don't.
+      printf '%s\n' "rate limited — not polling for another $(human_secs $(( cooldown - now )))" \
+        > "$RUN_DIR/err.$i"
+      use_cache "$i" "$base" "$now"
+    elif fetch_usage "${ACC_SVC[$i]}" "${ACC_NAME[$i]}" $(( now + budget )); then
+      rows_from_json "$USAGE_JSON" > "$RUN_DIR/rows.$i"
+      cp "$RUN_DIR/rows.$i" "$base.rows"
+      printf '%s\n' "$now" > "$base.stamp"
+      rm -f "$base.cooldown"
+      ACC_SRC[$i]="$RUN_DIR/rows.$i"
+      ACC_STALE[$i]=0
+    else
+      printf '%s\n' "$FETCH_ERR" > "$RUN_DIR/err.$i"
+      if (( FETCH_RETRY_AFTER > 0 )); then
+        # remember the lockout so the next cycles stay quiet, but never longer
+        # than COOLDOWN_MAX, so a bogus header can't freeze a column for a day
+        left=$FETCH_RETRY_AFTER
+        (( left > COOLDOWN_MAX )) && left=$COOLDOWN_MAX
+        printf '%s\n' "$(( now + left ))" > "$base.cooldown"
+      fi
+      # a throttled refresh shouldn't blank the column — show the last good
+      # numbers, marked stale, and let a later cycle refresh them
+      use_cache "$i" "$base" "$now"
+    fi
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+# All limit rows any account reported (fresh or last-good), deduped:
+# sort-order, state key, label.
+union_rows() {
+  local i=0
+  while (( i < ACC_COUNT )); do
+    [[ -n "${ACC_SRC[$i]}" ]] && cat "${ACC_SRC[$i]}" 2>/dev/null
+    i=$(( i + 1 ))
+  done | cut -f1,2,3 | sort -u
+}
+
+# percent<TAB>reset-epoch for one account/limit, empty when that account has no
+# such limit (plans differ, and scoped weeklies come and go).
+row_value() {
+  [[ -n "${ACC_SRC[$1]}" ]] || return 0
+  awk -F'\t' -v k="$2" '$2==k{print $4"\t"$5; exit}' "${ACC_SRC[$1]}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- render -----
+
+# Classic full-width row: label, wide bar, percent, long reset text.
 print_limit() {
-  local label="$1" pct="$2" reset_epoch="$3"
-  local color="$GREEN" width=24 filled bar
-  (( pct >= START_AT )) && color="$YELLOW"
-  (( pct >= CRITICAL_AT )) && color="$RED"
-  filled=$(( pct * width / 100 ))
-  (( filled > width )) && filled=$width
-  bar=$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' $(( width - filled )) '' | tr ' ' '░')
+  local label="$1" pct="$2" reset_epoch="$3" stale="${4:-0}" color
+  if (( stale > 0 )); then
+    color="$DIM"
+  else
+    color=$(pct_color "$pct")
+  fi
   printf "${BOLD}%-22s${RESET} ${color}%s %3d%%${RESET}  resets ${BOLD}%s${RESET}\n" \
-    "$label" "$bar" "$pct" "$(format_reset "$reset_epoch")"
+    "$label" "$(make_bar "$pct" 24)" "$pct" "$(format_reset "$reset_epoch")"
+}
+
+render_stacked() {
+  local i=0 order key label pct epoch
+  while (( i < ACC_COUNT )); do
+    printf "${BOLD}%s${RESET}${DIM}%s%s${RESET}\n" \
+      "${ACC_NAME[$i]}" "${ACC_EMAIL[$i]:+  ${ACC_EMAIL[$i]}}" "$(stale_note "${ACC_STALE[$i]}")"
+    if [[ -z "${ACC_SRC[$i]}" ]]; then
+      printf "  ${RED}unavailable${RESET} ${DIM}— %s${RESET}\n" "$(cat "$RUN_DIR/err.$i" 2>/dev/null)"
+    else
+      while IFS=$'\t' read -r order key label pct epoch; do
+        [[ -n "$key" ]] || continue
+        print_limit "$label" "$pct" "$epoch" "${ACC_STALE[$i]}"
+      done < "${ACC_SRC[$i]}"
+    fi
+    i=$(( i + 1 ))
+    if (( i < ACC_COUNT )); then
+      echo
+    fi
+  done
+  return 0
+}
+
+# One column per account, sharing a single label column on the left. Bar width
+# shrinks to fit the terminal; if even the narrowest bar won't fit, the caller
+# falls back to render_stacked.
+render_columns() {
+  local bar_w="$1" cell_w="$2" reset_w="$3" reset_fmt="$4" gap="$5"
+  local i order key label pct epoch color head
+  local err_shown=()
+  for (( i = 0; i < ACC_COUNT; i++ )); do
+    err_shown[$i]=0
+  done
+
+  # Two header lines: account name, then the email it belongs to.
+  printf '%*s' "$LABEL_W" ''
+  for (( i = 0; i < ACC_COUNT; i++ )); do
+    (( i > 0 )) && printf '%*s' "$gap" ''
+    head="${ACC_NAME[$i]}"
+    printf "${BOLD}%-*s${RESET}" "$cell_w" "${head:0:$cell_w}"
+  done
+  echo
+  printf '%*s' "$LABEL_W" ''
+  for (( i = 0; i < ACC_COUNT; i++ )); do
+    (( i > 0 )) && printf '%*s' "$gap" ''
+    head="${ACC_EMAIL[$i]:--}$(stale_note "${ACC_STALE[$i]}")"   # ASCII only: printf pads by bytes
+    printf "${DIM}%-*s${RESET}" "$cell_w" "${head:0:$cell_w}"
+  done
+  echo
+
+  while IFS=$'\t' read -r order key label; do
+    [[ -n "$key" ]] || continue
+    printf "${BOLD}%-*s${RESET}" "$LABEL_W" "${label:0:$(( LABEL_W - 1 ))}"
+    for (( i = 0; i < ACC_COUNT; i++ )); do
+      (( i > 0 )) && printf '%*s' "$gap" ''
+      if [[ -z "${ACC_SRC[$i]}" ]]; then
+        # say it once per column, not once per row; the reason prints below
+        if (( err_shown[i] == 0 )); then
+          printf "${DIM}%-*s${RESET}" "$cell_w" "unavailable"
+          err_shown[$i]=1
+        else
+          printf '%*s' "$cell_w" ''
+        fi
+        continue
+      fi
+      IFS=$'\t' read -r pct epoch < <(row_value "$i" "$key")
+      if [[ -z "${pct:-}" ]]; then
+        printf "${DIM}%-*s${RESET}" "$cell_w" "-"
+        continue
+      fi
+      if (( ACC_STALE[i] > 0 )); then
+        color="$DIM"
+      else
+        color=$(pct_color "$pct")
+      fi
+      # bar is exactly bar_w glyphs and the reset text is ASCII, so the cell is
+      # exactly cell_w columns wide even though printf can't measure the colors.
+      printf "${color}%s %3d%%${RESET}  %-*s" \
+        "$(make_bar "$pct" "$bar_w")" "$pct" "$reset_w" "$($reset_fmt "$epoch")"
+    done
+    echo
+  done < <(union_rows)
+  return 0
+}
+
+render_errors() {
+  local i=0 color
+  while (( i < ACC_COUNT )); do
+    if [[ -s "$RUN_DIR/err.$i" ]]; then
+      # a failed refresh in watch mode is routine (this endpoint throttles hard),
+      # so keep it dim while last-good numbers are still on screen
+      if (( ACC_STALE[i] > 0 )); then color="$DIM"; else color="$RED"; fi
+      printf "${color}cclimits[%s]: %s${RESET}\n" "${ACC_NAME[$i]}" "$(cat "$RUN_DIR/err.$i")" >&2
+    fi
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+# Notification state is keyed "<account>/<limit>" so the two accounts never
+# share (or suppress) each other's thresholds.
+process_alerts() {
+  local i=0 order key label pct epoch level prev
+  while (( i < ACC_COUNT )); do
+    while IFS=$'\t' read -r order key label pct epoch; do
+      [[ -n "$key" ]] || continue
+      level=$(notify_level "$pct")
+      prev=$(state_get "${ACC_NAME[$i]}/$key")
+      if (( level > prev )); then
+        if $ALERT_ENABLED; then
+          fire_alert "${ACC_NAME[$i]}" "$label" "$pct" "$epoch"
+          printf "${RED}${BOLD}⚠ notified: %s — %s at %d%%${RESET}\n" "${ACC_NAME[$i]}" "$label" "$pct"
+        fi
+        state_set "${ACC_NAME[$i]}/$key" "$level"
+      elif (( level < prev )); then
+        # Usage dropped (window reset) — re-arm so the next climb notifies again.
+        state_set "${ACC_NAME[$i]}/$key" "$level"
+      fi
+    done < "$RUN_DIR/rows.$i"
+    i=$(( i + 1 ))
+  done
+  return 0
 }
 
 show_status() {
-  fetch_usage || return 1
+  collect_all
 
-  local now_str
+  local now_str width bar_w cell_w total reset_w reset_fmt gap picked=0 min_cols
+  min_cols=$(( LABEL_W + ACC_COUNT * (BAR_MIN + 1 + 4 + 2 + RESET_W_SHORT) + (ACC_COUNT - 1) * GAP ))
   now_str=$(TZ="America/New_York" date "+%Y-%m-%d %H:%M:%S %Z")
   printf "${DIM}as of %s — alerts from %d%%, every %d%%, every 1%% from %d%%${RESET}\n" \
     "$now_str" "$START_AT" "$STEP" "$CRITICAL_AT"
 
-  local kind group pct resets scope key label reset_epoch level prev
-  while IFS=$'\t' read -r kind group pct resets scope; do
-    key="$kind"
-    case "$kind" in
-      session)       label="Session (5h)" ;;
-      weekly_all)    label="Weekly (all models)" ;;
-      weekly_scoped) label="Weekly (${scope:-scoped})"; key="${kind}:${scope}" ;;
-      *)             label="$kind" ;;
-    esac
-
-    reset_epoch=$(iso_to_epoch "$resets")
-    print_limit "$label" "$pct" "$reset_epoch"
-
-    level=$(notify_level "$pct")
-    prev=$(state_get "$key")
-    if (( level > prev )); then
-      if $ALERT_ENABLED; then
-        fire_alert "$label" "$pct" "$reset_epoch"
-        printf "  ${RED}${BOLD}⚠ notified: %s at %d%%${RESET}\n" "$label" "$pct"
+  if (( ACC_COUNT == 1 )); then
+    render_stacked
+  else
+    width=$(term_width)
+    # Size the bar to whatever is left after the labels, percents and reset text,
+    # keeping the wall-clock reset time if it fits and dropping to the delta only
+    # if it doesn't. Leftover width goes into the gap (up to GAP_BONUS) so the
+    # columns spread across the window instead of hugging the left edge.
+    gap=$GAP
+    for reset_fmt in format_reset_compact format_reset_short; do
+      if [[ "$reset_fmt" == format_reset_compact ]]; then
+        reset_w=$RESET_W_FULL
+      else
+        reset_w=$RESET_W_SHORT
       fi
-      state_set "$key" "$level"
-    elif (( level < prev )); then
-      # Usage dropped (window reset) — re-arm so the next climb notifies again.
-      state_set "$key" "$level"
+      cell_w=$(( (width - LABEL_W - (ACC_COUNT - 1) * GAP) / ACC_COUNT ))
+      bar_w=$(( cell_w - 1 - 4 - 2 - reset_w ))
+      (( bar_w > BAR_MAX )) && bar_w=$BAR_MAX
+      if (( bar_w >= BAR_MIN )); then
+        cell_w=$(( bar_w + 1 + 4 + 2 + reset_w ))
+        total=$(( LABEL_W + ACC_COUNT * cell_w + (ACC_COUNT - 1) * GAP ))
+        if (( ACC_COUNT > 1 && total < width )); then
+          gap=$(( GAP + (width - total) / (ACC_COUNT - 1) ))
+          (( gap > GAP + GAP_BONUS )) && gap=$(( GAP + GAP_BONUS ))
+        fi
+        picked=1
+        break
+      fi
+    done
+    if (( picked == 1 )); then
+      render_columns "$bar_w" "$cell_w" "$reset_w" "$reset_fmt" "$gap"
+    else
+      # Say why, with the numbers — otherwise "why is this stacked?" is a mystery.
+      printf "${DIM}terminal is %d cols; columns need %d — stacking (widen the window, or --width N)${RESET}\n" \
+        "$width" "$min_cols"
+      render_stacked
     fi
-  done < <(echo "$USAGE_JSON" | jq -r \
-    '.limits[] | [.kind, .group, ((.percent // 0) | floor), (.resets_at // ""), (.scope.model.display_name // "")] | @tsv')
+  fi
+
+  render_errors
+  process_alerts
 }
+
+# ------------------------------------------------------------------ main -----
+
+load_accounts
+
+if $LIST_ACCOUNTS; then
+  if (( ACC_COUNT == 0 )); then
+    echo "cclimits: no logged-in Claude Code accounts found" >&2
+    exit 1
+  fi
+  i=0
+  while (( i < ACC_COUNT )); do
+    printf "${BOLD}%-14s${RESET} %-20s %-24s ${DIM}%s${RESET}\n" \
+      "${ACC_NAME[$i]}" "~${ACC_DIR[$i]#$HOME}" "${ACC_EMAIL[$i]:--}" "${ACC_SVC[$i]}"
+    i=$(( i + 1 ))
+  done
+  exit 0
+fi
+
+if (( ACC_COUNT == 0 )); then
+  if [[ -n "$ACCOUNT_FILTER" ]]; then
+    echo "cclimits: no account matched '$ACCOUNT_FILTER' (see --accounts)" >&2
+  else
+    echo "cclimits: no logged-in Claude Code accounts found in ~/.claude or ~/.claude-* — is Claude Code logged in?" >&2
+  fi
+  exit 1
+fi
+
+state_migrate
 
 if $WATCH; then
   # Runs until Ctrl-C, like watch(1)/tail -f — no time cap. Memory stays flat
   # because we render into the alternate screen buffer, so nothing accumulates
   # in scrollback (that alt-screen rendering, not a timer, is the real guard
-  # against the iTerm working-set freeze). RUN_DEADLINE=0 = retries never hit a
-  # ceiling either, since the process is meant to persist.
-  RUN_DEADLINE=0
-  trap 'printf "\033[?1049l"' EXIT
+  # against the iTerm working-set freeze). Each account's fetch is bounded by a
+  # slice of the refresh interval so one throttled account still lets the other
+  # render; it just retries on the next cycle.
+  ALT_SCREEN=true
   printf '\033[?1049h'
   while true; do
     printf '\033[H\033[2J'
@@ -348,8 +905,7 @@ if $WATCH; then
     sleep "$WATCH_INTERVAL"
   done
 else
-  # One-shot (cron/launchd): retry until it clears, bounded by ONESHOT_MAX_SECONDS
-  # so a stuck endpoint can't hang the run indefinitely.
-  RUN_DEADLINE=$(( $(date +%s) + ONESHOT_MAX_SECONDS ))
+  # One-shot (cron/launchd): retry until it clears, with the 6h ceiling split
+  # across accounts so a stuck endpoint can't hang the run indefinitely.
   show_status
 fi
