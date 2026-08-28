@@ -41,7 +41,11 @@ ALERT_ENABLED=true
 FETCH_RETRIES=0          # 0 = retry until it clears (truncated backoff); N>=1 caps total attempts
 RETRY_BASE=2             # base backoff seconds; grows 2,4,8… with jitter, capped at RETRY_MAX
 RETRY_MAX=60             # cap on any single backoff sleep (so it plateaus, doesn't grow unbounded)
-COOLDOWN_MAX=1800        # cap on how long a server Retry-After may silence one account (30m)
+COOLDOWN_MAX=21600       # sanity bound on a server Retry-After (6h); must stay well above any
+                         # value the endpoint actually sends, because truncating one makes us
+                         # probe DURING the lockout, and every such probe comes back with a
+                         # LONGER Retry-After (observed 1746s -> 2708s) — the penalty box
+                         # refreshes on contact, so an early probe never escapes it
 RETRY_AFTER_WAIT_MAX=120 # longest server-stated Retry-After worth blocking on; past it we bail and cache
 CACHE_MAX_AGE=21600      # stop showing last-good numbers once they are this old (6h)
 FETCH_RETRY_AFTER=0      # seconds a 429 asked us to wait; set by fetch_usage
@@ -462,6 +466,28 @@ backoff_delay() {
   awk -v d="$delay" -v j="$jitter" 'BEGIN{ printf "%.2f", d + j/1000 }'
 }
 
+# Seconds since this account's OAuth token expired, 0 while it is still valid.
+# Claude Code refreshes the token whenever the account is used, so an idle
+# account's token just goes stale in the Keychain. Local read, no request.
+token_expired_secs() {
+  local exp now
+  exp=$(security find-generic-password -s "$1" -w 2>/dev/null \
+    | jq -r '((.claudeAiOauth.expiresAt // 0) / 1000 | floor)' 2>/dev/null) || exp=0
+  [[ "$exp" =~ ^[0-9]+$ ]] || exp=0
+  now=$(date +%s)
+  if (( exp > 0 && exp < now )); then echo $(( now - exp )); else echo 0; fi
+}
+
+# Note for a throttled account whose token is also stale, empty otherwise. The
+# endpoint answers an expired token with 429 (an *invalid* one gets 401), so a
+# long lockout hides the fact that the token needs refreshing.
+token_hint() {
+  local age
+  age=$(token_expired_secs "$1")
+  (( age > 0 )) || return 0
+  printf " (token expired %s ago — run any '%s' command to refresh it)" "$(human_secs "$age")" "$2"
+}
+
 # fetch_usage <keychain-service> <account-name> <deadline-epoch|0>
 # Sets USAGE_JSON on success, FETCH_ERR on failure. The deadline bounds one
 # account's retrying so a throttled account can't starve the others.
@@ -627,7 +653,7 @@ collect_all() {
     if (( cooldown > now )); then
       # The server named the minute to come back; polling before then just
       # collects more 429s (and can extend the lockout), so don't.
-      printf '%s\n' "rate limited — not polling for another $(human_secs $(( cooldown - now )))" \
+      printf '%s\n' "rate limited — not polling for another $(human_secs $(( cooldown - now )))$(token_hint "${ACC_SVC[$i]}" "${ACC_NAME[$i]}")" \
         > "$RUN_DIR/err.$i"
       use_cache "$i" "$base" "$now"
     elif fetch_usage "${ACC_SVC[$i]}" "${ACC_NAME[$i]}" $(( now + budget )); then
@@ -638,6 +664,9 @@ collect_all() {
       ACC_SRC[$i]="$RUN_DIR/rows.$i"
       ACC_STALE[$i]=0
     else
+      case "$FETCH_ERR" in
+        "rate limited"*) FETCH_ERR="${FETCH_ERR}$(token_hint "${ACC_SVC[$i]}" "${ACC_NAME[$i]}")" ;;
+      esac
       printf '%s\n' "$FETCH_ERR" > "$RUN_DIR/err.$i"
       if (( FETCH_RETRY_AFTER > 0 )); then
         # remember the lockout so the next cycles stay quiet, but never longer
