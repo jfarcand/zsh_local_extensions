@@ -658,7 +658,11 @@ collect_all() {
     base=$(cache_base "${ACC_NAME[$i]}")
     tok_exp=$(token_expires_at "${ACC_SVC[$i]}")
     cooldown=0; cd_token=""
-    read -r cooldown cd_token < "$base.cooldown" 2>/dev/null || true
+    # guard the redirect: bash reports a failed "< missing-file" itself, before
+    # any 2>/dev/null on the same command can swallow it
+    if [[ -f "$base.cooldown" ]]; then
+      read -r cooldown cd_token < "$base.cooldown" || true
+    fi
     [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=0
     # A cooldown earned by one token says nothing about the next one: this
     # endpoint answers an expired token with 429, so refreshing it (any command
