@@ -466,14 +466,22 @@ backoff_delay() {
   awk -v d="$delay" -v j="$jitter" 'BEGIN{ printf "%.2f", d + j/1000 }'
 }
 
+# This account's token expiry (epoch seconds, 0 if unreadable). Doubles as the
+# token's identity: Claude Code writes a new expiresAt every time it refreshes.
+token_expires_at() {
+  local exp
+  exp=$(security find-generic-password -s "$1" -w 2>/dev/null \
+    | jq -r '((.claudeAiOauth.expiresAt // 0) / 1000 | floor)' 2>/dev/null) || exp=0
+  [[ "$exp" =~ ^[0-9]+$ ]] || exp=0
+  echo "$exp"
+}
+
 # Seconds since this account's OAuth token expired, 0 while it is still valid.
 # Claude Code refreshes the token whenever the account is used, so an idle
 # account's token just goes stale in the Keychain. Local read, no request.
 token_expired_secs() {
   local exp now
-  exp=$(security find-generic-password -s "$1" -w 2>/dev/null \
-    | jq -r '((.claudeAiOauth.expiresAt // 0) / 1000 | floor)' 2>/dev/null) || exp=0
-  [[ "$exp" =~ ^[0-9]+$ ]] || exp=0
+  exp=$(token_expires_at "$1")
   now=$(date +%s)
   if (( exp > 0 && exp < now )); then echo $(( now - exp )); else echo 0; fi
 }
@@ -636,7 +644,7 @@ use_cache() {
 # ones when the fetch failed. ACC_STALE[i] is 0 for fresh, the epoch the cached
 # rows were fetched at when stale, and -1 when there is nothing to show at all.
 collect_all() {
-  local i=0 budget now base cooldown left
+  local i=0 budget now base cooldown cd_token tok_exp left
   if $WATCH; then
     budget=$(( WATCH_INTERVAL / ACC_COUNT ))
     (( budget < 15 )) && budget=15
@@ -648,8 +656,18 @@ collect_all() {
     : > "$RUN_DIR/rows.$i"
     now=$(date +%s)
     base=$(cache_base "${ACC_NAME[$i]}")
-    cooldown=$(cat "$base.cooldown" 2>/dev/null || echo 0)
+    tok_exp=$(token_expires_at "${ACC_SVC[$i]}")
+    cooldown=0; cd_token=""
+    read -r cooldown cd_token < "$base.cooldown" 2>/dev/null || true
     [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=0
+    # A cooldown earned by one token says nothing about the next one: this
+    # endpoint answers an expired token with 429, so refreshing it (any command
+    # on that account) is the actual fix, and we must not keep sitting out a
+    # lockout that the old token earned.
+    if [[ -n "$cd_token" && "$cd_token" != "$tok_exp" ]]; then
+      rm -f "$base.cooldown"
+      cooldown=0
+    fi
     if (( cooldown > now )); then
       # The server named the minute to come back; polling before then just
       # collects more 429s (and can extend the lockout), so don't.
@@ -673,7 +691,7 @@ collect_all() {
         # than COOLDOWN_MAX, so a bogus header can't freeze a column for a day
         left=$FETCH_RETRY_AFTER
         (( left > COOLDOWN_MAX )) && left=$COOLDOWN_MAX
-        printf '%s\n' "$(( now + left ))" > "$base.cooldown"
+        printf '%s %s\n' "$(( now + left ))" "$tok_exp" > "$base.cooldown"
       fi
       # a throttled refresh shouldn't blank the column — show the last good
       # numbers, marked stale, and let a later cycle refresh them
