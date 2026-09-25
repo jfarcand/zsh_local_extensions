@@ -1,0 +1,27 @@
+#!/bin/zsh
+# ccc: open a Claude Code tmux pane on 2Q84 from 1Q84.
+# Unlocks 2Q84's login keychain first: every SSH session starts with it locked
+# (the unlock is per session), which makes claude report "Not logged in".
+# The password comes from 1Q84's keychain item "2Q84-login" and rides in the
+# LC_CCC_KC env var (2Q84's sshd accepts LC_*), never argv; the remote side
+# unsets it before tmux starts. Without the item, 2Q84 prompts for it.
+# Then ~/.local/bin/ccc-tmux lists the sessions to attach or starts a fresh one;
+# `ccc oss` makes that fresh one an oss-account session (LC_CCC_ACCOUNT).
+LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
+export LC_CCC_KC
+case "$1" in
+  ""|work) export LC_CCC_ACCOUNT=work ;;
+  oss) export LC_CCC_ACCOUNT=oss ;;
+  *) echo "usage: ccc [oss]"; exit 1 ;;
+esac
+exec ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT mbp '
+kc=$HOME/Library/Keychains/login.keychain-db
+if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
+  if [ -z "$LC_CCC_KC" ] || ! printf "unlock-keychain -p %s %s\n" "$(printf %q "$LC_CCC_KC")" "$kc" | security -i >/dev/null 2>&1; then
+    echo "2Q84 login keychain is locked; unlocking it for Claude Code."
+    security unlock-keychain "$kc" || exit 1
+  fi
+fi
+unset LC_CCC_KC
+exec $HOME/.local/bin/ccc-tmux
+'

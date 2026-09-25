@@ -1,0 +1,9 @@
+#!/bin/zsh
+# ssh-mbp-fwd: the connection behind the local.ssh-mbp-fwd LaunchAgent, carrying
+# every 1Q84<->2Q84 forward (see ~/.ssh/config Host mbp-fwd). A connection that
+# died while 2Q84 slept leaves its sshd holding 127.0.0.1:17777 there, so every
+# restart failed to bind; the stale holder is ended first. Only a previous
+# forwarder binds that port.
+ssh -o BatchMode=yes -o ConnectTimeout=10 mbp \
+  'pid=$(lsof -t -nP -iTCP@127.0.0.1:17777 -sTCP:LISTEN 2>/dev/null); [ -n "$pid" ] && kill $pid; true'
+exec /usr/bin/ssh -N -o BatchMode=yes mbp-fwd

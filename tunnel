@@ -1,0 +1,22 @@
+#!/bin/zsh
+# tunnel: forward localhost ports from 1Q84 to 2Q84 and hold until Ctrl-C.
+# `tunnel 57857 8090` forwards those ports; bare `tunnel` finds the callback
+# port of every pending Claude Code /login on 2Q84 (a `2.1.*` process listening
+# on 127.0.0.1) so the browser redirect on this Mac reaches it.
+host=mbp
+ports=("$@")
+if (( ${#ports} == 0 )); then
+  ports=(${(f)"$(ssh -o BatchMode=yes $host "lsof -nP -a -iTCP@127.0.0.1 -sTCP:LISTEN -c 2.1. -Fn 2>/dev/null | sed -n 's/^n127.0.0.1://p' | sort -u")"})
+  if (( ${#ports} == 0 )); then
+    echo "No pending Claude login on 2Q84. Pass the port from the browser URL: tunnel <port>"
+    exit 1
+  fi
+fi
+forwards=()
+for p in $ports; do
+  [[ "$p" == <1-65535> ]] || { echo "Not a port: $p"; exit 1; }
+  forwards+=(-L "$p:127.0.0.1:$p")
+done
+echo "Tunnel to 2Q84 open on port(s): ${(j:, :)ports}. Ctrl-C to close."
+trap 'echo "\nTunnel closed."' INT
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 $forwards $host
