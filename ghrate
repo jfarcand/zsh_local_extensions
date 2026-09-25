@@ -2,18 +2,33 @@
 # ghrate - Show GitHub API rate limit status and when it resets (EDT)
 #
 # Usage:
-#   ghrate                  # show all resource buckets
-#   ghrate core             # show only the "core" bucket
-#   ghrate -w [SECONDS]     # watch mode, refresh every N seconds (default 30)
-#   ghrate --burn [SECONDS] # measure burn rate over N seconds (default 10)
+#   ghrate                       # show all resource buckets
+#   ghrate core                  # show only the "core" bucket
+#   ghrate -w [SECONDS]          # watch mode, refresh every N seconds (default 30)
+#   ghrate --burn [SECONDS]      # measure burn rate over N seconds (default 10)
+#   ghrate --threshold N         # alert below N remaining (default 1000)
+#   ghrate --alert-bucket NAME   # bucket to alert on (default: core, or filter)
+#   ghrate --no-alert            # disable sound + macOS notification on alerts
+#   ghrate --callers             # also snapshot local processes with open TCP to GitHub
+#   ghrate --callers-only        # only show the callers snapshot (skip rate-limit)
+#
+# Note: gh api rate_limit does NOT count against any bucket — safe to poll.
 
 set -euo pipefail
 
 WATCH=false
 WATCH_INTERVAL=30
+WATCH_MAX_SECONDS=21600   # auto-exit watch after 6h so a forgotten loop can't linger
 BURN=false
 BURN_INTERVAL=10
 FILTER=""
+THRESHOLD=1000
+ALERT_BUCKET=""
+ALERT_ENABLED=true
+CALLERS=false
+CALLERS_ONLY=false
+declare -A PREV_USED
+declare -A ALERT_FIRED
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,8 +48,34 @@ while [[ $# -gt 0 ]]; do
       fi
       shift
       ;;
+    --threshold)
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        THRESHOLD="$2"
+        shift 2
+      else
+        echo "ghrate: --threshold requires a number" >&2
+        exit 1
+      fi
+      ;;
+    --alert-bucket)
+      ALERT_BUCKET="${2:-}"
+      shift 2
+      ;;
+    --no-alert)
+      ALERT_ENABLED=false
+      shift
+      ;;
+    --callers)
+      CALLERS=true
+      shift
+      ;;
+    --callers-only)
+      CALLERS=true
+      CALLERS_ONLY=true
+      shift
+      ;;
     -h|--help)
-      sed -n '2,8p' "$0" | sed 's/^# \?//'
+      sed -n '2,15p' "$0" | sed 's/^# \?//'
       exit 0
       ;;
     *)
@@ -82,7 +123,7 @@ format_reset() {
 }
 
 print_bucket() {
-  local name="$1" limit="$2" used="$3" remaining="$4" reset="$5"
+  local name="$1" limit="$2" used="$3" remaining="$4" reset="$5" delta="${6:-}"
   local color when
 
   if (( remaining == 0 )); then
@@ -95,8 +136,87 @@ print_bucket() {
 
   when=$(format_reset "$reset")
 
-  printf "${BOLD}%-22s${RESET} ${color}%5d / %-5d remaining${RESET}  ${DIM}used %-5d${RESET}  resets ${BOLD}%s${RESET}\n" \
-    "$name" "$remaining" "$limit" "$used" "$when"
+  if [[ -n "$delta" ]]; then
+    printf "${BOLD}%-22s${RESET} ${color}%5d / %-5d remaining${RESET}  ${DIM}used %-5d${RESET}  %b  resets ${BOLD}%s${RESET}\n" \
+      "$name" "$remaining" "$limit" "$used" "$delta" "$when"
+  else
+    printf "${BOLD}%-22s${RESET} ${color}%5d / %-5d remaining${RESET}  ${DIM}used %-5d${RESET}  resets ${BOLD}%s${RESET}\n" \
+      "$name" "$remaining" "$limit" "$used" "$when"
+  fi
+}
+
+fire_alert() {
+  local name="$1" remaining="$2" limit="$3"
+  if command -v afplay >/dev/null 2>&1; then
+    afplay /System/Library/Sounds/Sosumi.aiff >/dev/null 2>&1 &
+  fi
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"${name}: ${remaining}/${limit} remaining\" with title \"ghrate: low rate limit\" sound name \"Sosumi\"" >/dev/null 2>&1 || true
+  fi
+}
+
+show_callers() {
+  # Snapshot local TCP sockets to GitHub IPs and aggregate by PID.
+  # GitHub's published CIDR blocks for api/web: 140.82.112.0/20, 192.30.252.0/22,
+  # 185.199.108.0/22, 143.55.64.0/20. We also resolve api/codeload/github at runtime
+  # to catch IPs outside those blocks.
+  local gh_ips=""
+  if command -v dig >/dev/null 2>&1; then
+    gh_ips=$(dig +short +time=1 +tries=1 api.github.com codeload.github.com github.com 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+  elif command -v host >/dev/null 2>&1; then
+    gh_ips=$(for h in api.github.com codeload.github.com github.com; do
+      host "$h" 2>/dev/null | awk '/has address/{print $4}'
+    done | sort -u)
+  fi
+
+  local prefix_regex='->(140\.82\.|192\.30\.|185\.199\.|143\.55\.)'
+  local ip_regex=""
+  if [[ -n "$gh_ips" ]]; then
+    ip_regex=$(echo "$gh_ips" | sed 's/\./\\./g' | tr '\n' '|' | sed 's/|$//')
+    ip_regex="->(${ip_regex}):"
+  fi
+
+  local combined_regex="$prefix_regex"
+  [[ -n "$ip_regex" ]] && combined_regex="(${prefix_regex}|${ip_regex})"
+
+  printf "\n${BOLD}── callers (TCP to GitHub) ──${RESET}\n"
+
+  local lsof_out
+  lsof_out=$(lsof -i -n -P -sTCP:ESTABLISHED 2>/dev/null | awk '/:443/' || true)
+  if [[ -z "$lsof_out" ]]; then
+    printf "  ${DIM}(no ESTABLISHED :443 sockets visible — try sudo for system sockets)${RESET}\n"
+    return 0
+  fi
+
+  local matches
+  matches=$(echo "$lsof_out" | grep -E "$combined_regex" || true)
+  if [[ -z "$matches" ]]; then
+    printf "  ${DIM}(no active connections to GitHub IPs)${RESET}\n"
+    return 0
+  fi
+
+  local agg
+  agg=$(echo "$matches" | awk '{
+      cmd=$1; pid=$2; user=$3
+      count[pid]++
+      cmds[pid]=cmd
+      users[pid]=user
+    }
+    END {
+      for (p in count) printf "%d\t%s\t%s\t%d\n", p, cmds[p], users[p], count[p]
+    }' | sort -t$'\t' -k4 -rn)
+
+  printf "${DIM}%-6s %-18s %-14s %-5s %-9s %s${RESET}\n" "PID" "COMMAND" "USER" "CONN" "AGE" "FULL CMD"
+  local pid cmd user conns etime full_cmd
+  while IFS=$'\t' read -r pid cmd user conns; do
+    etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    [[ -z "$etime" ]] && etime="?"
+    full_cmd=$(ps -ww -o command= -p "$pid" 2>/dev/null | cut -c1-72)
+    [[ -z "$full_cmd" ]] && full_cmd="(gone)"
+    printf "${BOLD}%-6s${RESET} %-18s ${DIM}%-14s${RESET} ${BOLD}%4d${RESET}  %-9s %s\n" \
+      "$pid" "$cmd" "$user" "$conns" "$etime" "$full_cmd"
+  done <<< "$agg"
 }
 
 show_status() {
@@ -112,11 +232,40 @@ show_status() {
 
   local jq_filter='.resources | to_entries[] | "\(.key)\t\(.value.limit)\t\(.value.used)\t\(.value.remaining)\t\(.value.reset)"'
 
+  local target_bucket="${ALERT_BUCKET:-${FILTER:-core}}"
+
   while IFS=$'\t' read -r name limit used remaining reset; do
     if [[ -n "$FILTER" && "$name" != "$FILTER" ]]; then
       continue
     fi
-    print_bucket "$name" "$limit" "$used" "$remaining" "$reset"
+
+    local delta_field=""
+    local prev="${PREV_USED[$name]:-}"
+    if [[ -n "$prev" ]]; then
+      local d=$(( used - prev ))
+      if (( d > 0 )); then
+        delta_field="${RED}${BOLD}Δ +${d}${RESET}"
+      elif (( d < 0 )); then
+        delta_field="${DIM}Δ ${d}${RESET}"
+      else
+        delta_field="${DIM}Δ 0${RESET}"
+      fi
+    fi
+    PREV_USED[$name]=$used
+
+    print_bucket "$name" "$limit" "$used" "$remaining" "$reset" "$delta_field"
+
+    if [[ "$name" == "$target_bucket" ]]; then
+      if (( remaining < THRESHOLD )); then
+        printf "  ${RED}${BOLD}⚠ %s below threshold (%d < %d)${RESET}\n" "$name" "$remaining" "$THRESHOLD"
+        if $ALERT_ENABLED && [[ -z "${ALERT_FIRED[$name]:-}" ]]; then
+          fire_alert "$name" "$remaining" "$limit"
+          ALERT_FIRED[$name]=1
+        fi
+      else
+        unset 'ALERT_FIRED[$name]' || true
+      fi
+    fi
   done < <(echo "$json" | jq -r "$jq_filter")
 }
 
@@ -180,12 +329,25 @@ show_burn() {
 if $BURN; then
   show_burn
 elif $WATCH; then
+  # Render into the alternate screen buffer so periodic refreshes never
+  # accumulate in terminal scrollback (this is what lets iTerm grow without
+  # bound over a long watch). Restore the primary screen on any exit, and
+  # auto-stop after WATCH_MAX_SECONDS so a forgotten watch can't run for days.
+  trap 'printf "\033[?1049l"' EXIT
+  printf '\033[?1049h'
+  watch_deadline=$(( $(date +%s) + WATCH_MAX_SECONDS ))
   while true; do
-    clear
-    show_status || true
+    printf '\033[H\033[2J'
+    $CALLERS_ONLY || show_status || true
+    $CALLERS && show_callers || true
+    if (( $(date +%s) >= watch_deadline )); then
+      printf "\n${DIM}auto-exited after %ds — re-run to keep watching${RESET}\n" "$WATCH_MAX_SECONDS"
+      break
+    fi
     printf "\n${DIM}refreshing every %ds — Ctrl-C to stop${RESET}\n" "$WATCH_INTERVAL"
     sleep "$WATCH_INTERVAL"
   done
 else
-  show_status
+  $CALLERS_ONLY || show_status
+  $CALLERS && show_callers || true
 fi
