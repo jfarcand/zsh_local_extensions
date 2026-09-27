@@ -1,20 +1,50 @@
 #!/bin/zsh
 # ccc: open a Claude Code tmux pane on 2Q84 from 1Q84.
+#   ccc            session menu; Enter starts a new work-account session
+#   ccc oss        same, but a new session is bound to the oss account
+#   ccc <n>        attach tmux session n directly
+#   ccc recover    open an iTerm tab for every Claude session on 2Q84 that no
+#                  live pane here is showing (after drops, sleep, a restart)
 # Unlocks 2Q84's login keychain first: every SSH session starts with it locked
 # (the unlock is per session), which makes claude report "Not logged in".
 # The password comes from 1Q84's keychain item "2Q84-login" and rides in the
 # LC_CCC_KC env var (2Q84's sshd accepts LC_*), never argv; the remote side
 # unsets it before tmux starts. Without the item, 2Q84 prompts for it.
-# Then ~/.local/bin/ccc-tmux lists the sessions to attach or starts a fresh one;
-# `ccc oss` makes that fresh one an oss-account session (LC_CCC_ACCOUNT).
-LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
-export LC_CCC_KC
+# ~/.local/bin/ccc-tmux on 2Q84 does the rest; it tells a live pane from a
+# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS).
+
+# Source ports of this Mac's established SSH connections
+live_ports() {
+  lsof -nP -a -c ssh -iTCP:22 -sTCP:ESTABLISHED 2>/dev/null \
+    | awk 'NR > 1 { split($9, a, "->"); n = split(a[1], b, ":"); print b[n] }' \
+    | sort -u | paste -sd, -
+}
+
+export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
 case "$1" in
-  ""|work) export LC_CCC_ACCOUNT=work ;;
-  oss) export LC_CCC_ACCOUNT=oss ;;
-  *) echo "usage: ccc [oss]"; exit 1 ;;
+  ""|work) ;;
+  oss) LC_CCC_ACCOUNT=oss ;;
+  <->) LC_CCC_ATTACH=$1 ;;
+  recover)
+    LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
+      -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp .local/bin/ccc-tmux \
+      | while IFS=$'\t' read -r n acct state here title; do
+          [[ "$state" == shell || "$here" == yes ]] && continue
+          echo "Reopening session $n ($acct, $state): $title"
+          osascript -e 'tell application "iTerm2" to tell current window' \
+            -e 'set t to (create tab with default profile)' \
+            -e "tell current session of t to write text \"ccc $n\"" \
+            -e 'end tell' >/dev/null
+        done
+    exit 0 ;;
+  *) echo "usage: ccc [oss | <session> | recover]"; exit 1 ;;
 esac
-exec ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT mbp '
+
+LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
+LC_CCC_PORTS=$(live_ports)
+export LC_CCC_KC LC_CCC_PORTS
+exec ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
+  -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp '
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
   if [ -z "$LC_CCC_KC" ] || ! printf "unlock-keychain -p %s %s\n" "$(printf %q "$LC_CCC_KC")" "$kc" | security -i >/dev/null 2>&1; then
