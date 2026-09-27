@@ -34,7 +34,7 @@ case "$1" in
           osascript -e 'tell application "iTerm2" to tell current window' \
             -e 'set t to (create tab with default profile)' \
             -e "tell current session of t to write text \"ccc $n\"" \
-            -e 'end tell' >/dev/null
+            -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
   *) echo "usage: ccc [oss | <session> | recover]"; exit 1 ;;
