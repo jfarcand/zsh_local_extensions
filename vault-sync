@@ -67,6 +67,31 @@ notify() {
   osascript -e "display notification \"${message}\" with title \"${title}\" sound name \"Sosumi\"" >/dev/null 2>&1 || true
 }
 
+# Alert once per new problem, not once per run. A failure that persists would
+# otherwise re-post every 10 minutes (a stuck merge produced 302 identical alerts),
+# and an alert that fires all day stops being read. The last alerted problem per
+# vault is kept in STATE_DIR; a different problem alerts again, and the first clean
+# run after a problem posts a single "recovered" notice.
+alert() {
+  local vault="$1" kind="$2" title="$3" message="$4"
+  local f="$STATE_DIR/alert-$vault"
+  if [[ "$(cat "$f" 2>/dev/null)" == "$kind" ]]; then
+    return 0
+  fi
+  $DRY_RUN || printf '%s\n' "$kind" > "$f"
+  notify "$title" "$message"
+}
+
+clear_alert() {
+  local vault="$1"
+  local f="$STATE_DIR/alert-$vault"
+  [[ -f "$f" ]] || return 0
+  $DRY_RUN && return 0
+  log "$vault: recovered from $(cat "$f")"
+  rm -f "$f"
+  notify "vault-sync: $vault recovered" "Sync is working again."
+}
+
 rotate_log() {
   [[ -f "$LOG_FILE" ]] || return 0
   local size
@@ -136,7 +161,7 @@ sync_vault() {
   gitdir="$(cd "$vault" && cd "$gitdir" && pwd)"
   if [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" || -f "$gitdir/MERGE_HEAD" || -f "$gitdir/CHERRY_PICK_HEAD" ]]; then
     log "$name: BLOCKED rebase/merge in progress — resolve it by hand"
-    notify "vault-sync: $name blocked" "A rebase or merge is in progress. Sync is paused for this vault."
+    alert "$name" blocked "vault-sync: $name blocked" "A rebase or merge is in progress. Sync is paused for this vault."
     return 2
   fi
 
@@ -157,7 +182,7 @@ sync_vault() {
     if ! git -C "$vault" diff --cached --quiet; then
       if ! git -C "$vault" commit -q -m "vault: auto-save $(date '+%Y-%m-%d %H:%M:%S')" 2>>"$LOG_FILE"; then
         log "$name: FAILED commit (see log; a signing or hook error is most likely)"
-        notify "vault-sync: $name failed" "Commit failed. Check vault-sync log."
+        alert "$name" commit "vault-sync: $name failed" "Commit failed. Check vault-sync log."
         return 1
       fi
     fi
@@ -165,7 +190,7 @@ sync_vault() {
 
   if ! git -C "$vault" fetch --quiet origin 2>>"$LOG_FILE"; then
     log "$name: FAILED fetch (network or ssh auth)"
-    notify "vault-sync: $name failed" "Could not reach origin."
+    alert "$name" fetch "vault-sync: $name failed" "Could not reach origin."
     return 1
   fi
 
@@ -178,7 +203,7 @@ sync_vault() {
     if ! git -C "$vault" merge --no-edit -q '@{upstream}' >>"$LOG_FILE" 2>&1; then
       git -C "$vault" merge --abort 2>/dev/null || true
       log "$name: CONFLICT merging origin — merged nothing, resolve by hand"
-      notify "vault-sync: $name conflict" "Incoming changes conflict with local edits. Resolve by hand."
+      alert "$name" conflict "vault-sync: $name conflict" "Incoming changes conflict with local edits. Resolve by hand."
       return 2
     fi
     ahead=$(git -C "$vault" rev-list --count '@{upstream}..HEAD')
@@ -187,7 +212,7 @@ sync_vault() {
   if (( ahead > 0 )); then
     if ! git -C "$vault" push -q origin HEAD 2>>"$LOG_FILE"; then
       log "$name: FAILED push"
-      notify "vault-sync: $name failed" "Push to origin failed."
+      alert "$name" push "vault-sync: $name failed" "Push to origin failed."
       return 1
     fi
     log "$name: pushed $ahead commit(s)"
@@ -196,6 +221,7 @@ sync_vault() {
   elif $VERBOSE; then
     log "$name: nothing to do"
   fi
+  clear_alert "$name"
   return 0
 }
 
