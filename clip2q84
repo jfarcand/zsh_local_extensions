@@ -1,0 +1,42 @@
+#!/usr/bin/osascript -l JavaScript
+// clip2q84: copy every image put on 1Q84's clipboard to 2Q84's clipboard, so
+// pasting it in Claude Code running on 2Q84 (over ccc) works. Universal
+// Clipboard does not deliver reliably while 2Q84's screen sleeps or is locked.
+// Runs under the local.clip2q84 LaunchAgent; 2Q84's ~/.local/bin/clip-set-png
+// receives the PNG on stdin. Text is left alone: the terminal pastes it.
+ObjC.import('AppKit');
+
+const app = Application.currentApplication();
+app.includeStandardAdditions = true;
+const pasteboard = $.NSPasteboard.generalPasteboard;
+const png = $.NSTemporaryDirectory().js + 'clip2q84.png';
+let last = pasteboard.changeCount;
+// Universal Clipboard can echo 2Q84's copy back here; never resend the same image
+let sent = null;
+
+// PNG bytes of the clipboard image, converting TIFF (screenshots, many apps)
+function clipboardPng() {
+  let data = pasteboard.dataForType($.NSPasteboardTypePNG);
+  if (!data.isNil()) return data;
+  const tiff = pasteboard.dataForType($.NSPasteboardTypeTIFF);
+  if (tiff.isNil()) return null;
+  return $.NSBitmapImageRep.imageRepWithData(tiff)
+    .representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+}
+
+while (true) {
+  delay(1);
+  const count = pasteboard.changeCount;
+  if (count === last) continue;
+  last = count;
+  const data = clipboardPng();
+  if (!data || (sent && data.isEqualToData(sent))) continue;
+  sent = data;
+  data.writeToFileAtomically(png, true);
+  try {
+    app.doShellScript(
+      "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 mbp .local/bin/clip-set-png < '" + png + "'");
+  } catch (e) {
+    console.log('clip2q84: 2Q84 unreachable, image not sent: ' + e);
+  }
+}
