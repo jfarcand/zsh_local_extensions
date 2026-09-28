@@ -155,6 +155,10 @@ sync_vault() {
     return 0
   fi
 
+  # Name the vault after its remote repo, not its folder: a vault checked out as a
+  # project's claude_docs/ would otherwise log and alert as "claude_docs".
+  name="$(basename -s .git "$(git -C "$vault" remote get-url origin)")"
+
   # A half-finished rebase/merge blocks every git write. Report it instead of
   # piling on top — this is the state that silently froze dravr-vault for hours.
   local gitdir; gitdir="$(git -C "$vault" rev-parse --git-dir)"
