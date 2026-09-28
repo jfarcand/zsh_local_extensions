@@ -1,7 +1,9 @@
 #!/bin/zsh
 # ccc: open a Claude Code tmux pane on 2Q84 from 1Q84.
-#   ccc            session menu; Enter starts a new work-account session
+#   ccc            reattach the session this iTerm pane last showed, else the
+#                  session menu; Enter starts a new work-account session
 #   ccc oss        same, but a new session is bound to the oss account
+#   ccc menu       the session menu, even in a pane that has a session
 #   ccc <n>        attach tmux session n directly
 #   ccc recover    open an iTerm tab for every Claude session on 2Q84 that no
 #                  live pane here is showing (after drops, sleep, a restart)
@@ -11,7 +13,9 @@
 # LC_CCC_KC env var (2Q84's sshd accepts LC_*), never argv; the remote side
 # unsets it before tmux starts. Without the item, 2Q84 prompts for it.
 # ~/.local/bin/ccc-tmux on 2Q84 does the rest; it tells a live pane from a
-# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS).
+# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS),
+# and remembers each iTerm pane's session (LC_CCC_PANE). When the connection
+# drops (ssh exits 255), ccc reconnects to the same session until Ctrl-C.
 
 # Source ports of this Mac's established SSH connections
 live_ports() {
@@ -24,6 +28,7 @@ export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
 case "$1" in
   ""|work) ;;
   oss) LC_CCC_ACCOUNT=oss ;;
+  menu) LC_CCC_MODE=menu ;;
   <->) LC_CCC_ATTACH=$1 ;;
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
@@ -37,14 +42,13 @@ case "$1" in
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
-  *) echo "usage: ccc [oss | <session> | recover]"; exit 1 ;;
+  *) echo "usage: ccc [oss | menu | <session> | recover]"; exit 1 ;;
 esac
 
 LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
-LC_CCC_PORTS=$(live_ports)
-export LC_CCC_KC LC_CCC_PORTS
-exec ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
-  -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp '
+LC_CCC_PANE=${ITERM_SESSION_ID#*:}
+export LC_CCC_KC LC_CCC_PANE
+remote='
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
   if [ -z "$LC_CCC_KC" ] || ! printf "unlock-keychain -p %s %s\n" "$(printf %q "$LC_CCC_KC")" "$kc" | security -i >/dev/null 2>&1; then
@@ -55,3 +59,14 @@ fi
 unset LC_CCC_KC
 exec $HOME/.local/bin/ccc-tmux
 '
+while true; do
+  LC_CCC_PORTS=$(live_ports)
+  export LC_CCC_PORTS
+  ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
+    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_PANE mbp "$remote"
+  (( $? == 255 )) || exit 0
+  # The pane's session is remembered on 2Q84, so reconnecting lands back in it
+  LC_CCC_ATTACH= LC_CCC_MODE=
+  print -P "%F{yellow}Connection to 2Q84 lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
+  sleep 5 || exit 0
+done
