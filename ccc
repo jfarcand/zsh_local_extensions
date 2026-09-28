@@ -33,9 +33,9 @@ case "$1" in
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
       -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp .local/bin/ccc-tmux \
-      | while IFS=$'\t' read -r n acct state here title; do
+      | while IFS=$'\t' read -r n acct state here bilan title; do
           [[ "$state" == shell || "$here" == yes ]] && continue
-          echo "Reopening session $n ($acct, $state): $title"
+          echo "Reopening session $n ($acct, bilan $bilan, $state): $title"
           osascript -e 'tell application "iTerm2" to tell current window' \
             -e 'set t to (create tab with default profile)' \
             -e "tell current session of t to write text \"ccc $n\"" \
