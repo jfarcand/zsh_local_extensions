@@ -641,6 +641,19 @@ rows_from_json() {
     done
 }
 
+# Extra usage: the credits an org spends once a plan limit is reached (a Team
+# plan keeps sessions running past 100% on them). "<CUR> <amount> used", plus
+# ", limit reached" when the org's spend cap is hit; empty when it is off.
+# ASCII currency codes on purpose: the column renderer pads by bytes.
+extra_from_json() {
+  local cur amount reached
+  IFS=$'\t' read -r cur amount reached < <(echo "$1" | jq -r \
+    '.extra_usage // {} | select(.is_enabled == true)
+     | [(.currency // "-"), ((.used_credits // 0) / pow(10; .decimal_places // 2)), (.spend_limit_reached // false)] | @tsv') || true
+  [[ -n "$cur" ]] || return 0
+  printf '%s %.2f used%s\n' "$cur" "$amount" "$([[ "$reached" == true ]] && echo ', limit reached')"
+}
+
 # Cache and cooldown live under STATE_DIR, not the run's temp dir, so the last
 # good numbers survive a restart — which is the whole point when the endpoint
 # locks an account out for half an hour.
@@ -679,6 +692,7 @@ collect_all() {
     : > "$RUN_DIR/rows.$i"
     now=$(date +%s)
     base=$(cache_base "${ACC_NAME[$i]}")
+    ACC_EXTRA[$i]="$base.extra"
     tok_exp=$(token_expires_at "${ACC_SVC[$i]}")
     cooldown=0; cd_token=""
     # guard the redirect: bash reports a failed "< missing-file" itself, before
@@ -703,6 +717,7 @@ collect_all() {
       use_cache "$i" "$base" "$now"
     elif fetch_usage "${ACC_SVC[$i]}" "${ACC_NAME[$i]}" $(( now + budget )); then
       rows_from_json "$USAGE_JSON" > "$RUN_DIR/rows.$i"
+      extra_from_json "$USAGE_JSON" > "$base.extra"
       cp "$RUN_DIR/rows.$i" "$base.rows"
       printf '%s\n' "$now" > "$base.stamp"
       rm -f "$base.cooldown"
@@ -772,6 +787,11 @@ render_stacked() {
         [[ -n "$key" ]] || continue
         print_limit "$label" "$pct" "$epoch" "${ACC_STALE[$i]}"
       done < "${ACC_SRC[$i]}"
+      # no file until an account's first good fetch; set -e must not see that
+      extra=$(cat "${ACC_EXTRA[$i]}" 2>/dev/null || true)
+      if [[ -n "$extra" ]]; then
+        printf "${BOLD}%-22s${RESET} ${YELLOW}%s${RESET}\n" "Extra usage" "$extra"
+      fi
     fi
     i=$(( i + 1 ))
     if (( i < ACC_COUNT )); then
@@ -840,6 +860,24 @@ render_columns() {
     done
     echo
   done < <(union_rows)
+
+  local extras=() any=false
+  for (( i = 0; i < ACC_COUNT; i++ )); do
+    extras[$i]=$(cat "${ACC_EXTRA[$i]}" 2>/dev/null || true)
+    if [[ -n "${extras[$i]}" ]]; then any=true; fi
+  done
+  if $any; then
+    printf "${BOLD}%-*s${RESET}" "$LABEL_W" "Extra usage"
+    for (( i = 0; i < ACC_COUNT; i++ )); do
+      (( i > 0 )) && printf '%*s' "$gap" ''
+      if [[ -n "${extras[$i]}" ]]; then
+        printf "${YELLOW}%-*s${RESET}" "$cell_w" "${extras[$i]:0:$cell_w}"
+      else
+        printf "${DIM}%-*s${RESET}" "$cell_w" "-"
+      fi
+    done
+    echo
+  fi
   return 0
 }
 
