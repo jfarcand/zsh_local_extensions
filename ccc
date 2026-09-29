@@ -6,6 +6,7 @@
 #   ccc list       the session menu; Enter starts a new work-account session
 #   ccc new        a new work-account session, no menu
 #   ccc oss ...    same, but a new session is bound to the oss account
+#   ccc gatling .. same, bound to the Gatling Team account (~/.claude-gatling)
 #   ccc <n>        attach tmux session n directly
 #   ccc recover    open an iTerm tab for every Claude session on 2Q84 that no
 #                  live pane here is showing (after drops, sleep, a restart)
@@ -43,7 +44,7 @@ pane_tag() {
 export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
 for arg in "$@"; do case "$arg" in
   work) ;;
-  oss) LC_CCC_ACCOUNT=oss ;;
+  oss|gatling) LC_CCC_ACCOUNT=$arg ;;
   list|new) LC_CCC_MODE=$arg ;;
   <->) LC_CCC_ATTACH=$arg ;;
   recover)
@@ -58,7 +59,7 @@ for arg in "$@"; do case "$arg" in
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
-  *) echo "usage: ccc [list | new | <session> | recover] [oss]"; exit 1 ;;
+  *) echo "usage: ccc [list | new | <session> | recover] [oss | gatling]"; exit 1 ;;
 esac; done
 
 LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
