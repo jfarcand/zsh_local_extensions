@@ -13,7 +13,7 @@
 # ~/.local/bin/ccc-tmux on 2Q84 does the rest; it tells a live pane from a
 # stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS),
 # and remembers each iTerm pane's session (LC_CCC_PANE). When the connection
-# drops (ssh exits 255), ccc reconnects to the same session until Ctrl-C.
+# drops, ccc reconnects to the same session until Ctrl-C.
 
 # Source ports of this Mac's established SSH connections
 live_ports() {
@@ -61,7 +61,10 @@ while true; do
   export LC_CCC_PORTS
   ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
     -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_PANE mbp "$remote"
-  (( $? == 255 )) || exit 0
+  # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
+  # else (255 connection lost, a killed ssh) reconnects
+  rc=$?
+  (( rc == 0 || rc == 130 )) && exit $rc
   # The pane's session is remembered on 2Q84, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE=resume
   print -P "%F{yellow}Connection to 2Q84 lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
