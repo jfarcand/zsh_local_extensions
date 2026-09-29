@@ -63,6 +63,10 @@ esac; done
 
 LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
 export LC_CCC_KC
+
+# 2Q84 paints the pane in its tmux session's colour on attach; leaving ccc
+# gives the pane its own colours back
+reset_colours() { printf '\033]6;1;bg;*;default\a\033]111\a' }
 remote='
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
@@ -82,9 +86,9 @@ while true; do
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
-  (( rc == 0 || rc == 130 )) && exit $rc
+  (( rc == 0 || rc == 130 )) && { reset_colours; exit $rc }
   # The pane's tag names the conversation, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE=
   print -P "%F{yellow}Connection to 2Q84 lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
-  sleep 5 || exit 0
+  sleep 5 || { reset_colours; exit 0 }
 done
