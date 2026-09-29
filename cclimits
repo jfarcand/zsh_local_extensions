@@ -331,6 +331,23 @@ load_accounts() {
     ACC_EMAIL[$ACC_COUNT]="$email"
     ACC_COUNT=$(( ACC_COUNT + 1 ))
   done < <(discover_accounts)
+  number_duplicate_labels
+}
+
+# Two accounts can still read the same ("<email>" twice when neither org can
+# be told apart): number the later ones "(2)", "(3)" so no two columns match
+number_duplicate_labels() {
+  local i j seen
+  i=1
+  while (( i < ACC_COUNT )); do
+    seen=1 j=0
+    while (( j < i )); do
+      [[ -n "${ACC_EMAIL[$i]}" && "${ACC_EMAIL[$j]%% (*}" == "${ACC_EMAIL[$i]}" ]] && seen=$(( seen + 1 ))
+      j=$(( j + 1 ))
+    done
+    (( seen > 1 )) && ACC_EMAIL[$i]="${ACC_EMAIL[$i]} ($seen)"
+    i=$(( i + 1 ))
+  done
 }
 
 # ------------------------------------------------------------ formatting -----
