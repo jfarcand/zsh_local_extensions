@@ -14,6 +14,17 @@
 #   cclimits --retries N         # cap attempts on 429/5xx/network (default 0 = retry until it clears)
 #   cclimits --test              # fire a test macOS notification and exit
 #   cclimits --reset             # clear saved notification state and cached usage
+#   cclimits --guard             # no display: update the block list (see below)
+#
+# Guard: a plan past its limit does not stop Claude Code when the org has
+# extra usage on (Gatling's Team plan); sessions keep running and bill usage
+# credits. --guard marks every account that is at 100% on a limit while extra
+# usage is on as blocked, in ~/.local/state/cclimits/guard/<account> ("<reset
+# epoch>\t<reason>"), clears it once the account is back under, notifies on
+# both, and copies the list to each host in CCLIMITS_GUARD_HOSTS (ssh names).
+# The cclimits-guard Claude Code hook refuses prompts and tool calls for a
+# blocked account on every Mac that has the list. The local.cclimits-guard
+# LaunchAgent runs --guard every 5 minutes.
 #
 # Accounts are auto-discovered: ~/.claude plus every ~/.claude-* config dir that
 # has Keychain credentials (Claude Code stores them under
@@ -32,6 +43,7 @@
 set -euo pipefail
 
 WATCH=false
+GUARD=false
 WATCH_INTERVAL=60
 ONESHOT_MAX_SECONDS=21600 # one-shot retry ceiling (6h): a stuck endpoint can't hang a cron run forever
 START_AT=60
@@ -66,6 +78,8 @@ RESET_W_SHORT=10         # "in 121h30m" — reset text when columns are tight
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits"
 STATE_FILE="$STATE_DIR/state"
 CACHE_DIR="$STATE_DIR/cache"
+GUARD_DIR="$STATE_DIR/guard"
+GUARD_REUSE_SECONDS=240   # a --guard pass reuses numbers fetched this recently
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -143,6 +157,10 @@ while [[ $# -gt 0 ]]; do
       osascript -e 'display notification "Notifications are working." with title "cclimits: test" sound name "Sosumi"'
       echo "cclimits: test notification sent (if nothing appeared, allow notifications for your terminal in System Settings → Notifications)"
       exit 0
+      ;;
+    --guard)
+      GUARD=true
+      shift
       ;;
     --reset)
       rm -f "$STATE_FILE"
@@ -680,8 +698,9 @@ use_cache() {
 # ones when the fetch failed. ACC_STALE[i] is 0 for fresh, the epoch the cached
 # rows were fetched at when stale, and -1 when there is nothing to show at all.
 collect_all() {
-  local i=0 budget now base cooldown cd_token tok_exp left
-  if $WATCH; then
+  local i=0 budget now base cooldown cd_token tok_exp left fresh
+  # a guard pass runs every few minutes, so it gets a watch-sized budget too
+  if $WATCH || $GUARD; then
     budget=$(( WATCH_INTERVAL / ACC_COUNT ))
     (( budget < 15 )) && budget=15
   else
@@ -709,7 +728,14 @@ collect_all() {
       rm -f "$base.cooldown"
       cooldown=0
     fi
-    if (( cooldown > now )); then
+    fresh=$(cat "$base.stamp" 2>/dev/null || echo 0)
+    [[ "$fresh" =~ ^[0-9]+$ ]] || fresh=0
+    if $GUARD && (( now - fresh < GUARD_REUSE_SECONDS )); then
+      # a watch or another pass fetched this account moments ago: reuse its
+      # numbers rather than add a request to an endpoint that 429s readily
+      ACC_SRC[$i]="$base.rows"
+      ACC_STALE[$i]=0
+    elif (( cooldown > now )); then
       # The server named the minute to come back; polling before then just
       # collects more 429s (and can extend the lockout), so don't.
       printf '%s\n' "rate limited — not polling for another $(human_secs $(( cooldown - now )))$(token_hint "${ACC_SVC[$i]}" "${ACC_NAME[$i]}")" \
@@ -974,6 +1000,53 @@ show_status() {
 
 # ------------------------------------------------------------------ main -----
 
+# Block (or unblock) every account from this cycle's numbers. An account with
+# no numbers this cycle keeps its previous state; the hook itself lets a block
+# lapse at its reset time, so a stale block cannot outlive the window.
+guard_update() {
+  local i order key label pct epoch extra until reason f was
+  mkdir -p "$GUARD_DIR"
+  for (( i = 0; i < ACC_COUNT; i++ )); do
+    [[ -n "${ACC_SRC[$i]}" ]] || continue
+    f="$GUARD_DIR/${ACC_NAME[$i]}"
+    extra=$(cat "${ACC_EXTRA[$i]}" 2>/dev/null || true)
+    until=0 reason=""
+    if [[ -n "$extra" ]]; then
+      while IFS=$'\t' read -r order key label pct epoch; do
+        [[ -n "$key" && "$pct" =~ ^[0-9]+$ ]] || continue
+        if (( pct >= 100 )) && (( ${epoch:-0} > until )); then
+          until=${epoch:-0} reason="$label at ${pct}%, extra usage $extra"
+        fi
+      done < "${ACC_SRC[$i]}"
+    fi
+    was=false; [[ -f "$f" ]] && was=true
+    if (( until > 0 )); then
+      printf '%s\t%s\n' "$until" "$reason" > "$f"
+      if ! $was; then
+        guard_notify "${ACC_NAME[$i]} blocked" "$reason — until $(TZ="America/New_York" date -r "$until" "+%H:%M %Z")"
+      fi
+    elif $was; then
+      rm -f "$f"
+      guard_notify "${ACC_NAME[$i]} unblocked" "back under its plan limits"
+    fi
+  done
+  local host
+  for host in ${CCLIMITS_GUARD_HOSTS:-}; do
+    if ! { ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" 'mkdir -p .local/state/cclimits/guard' &&
+           rsync -a --delete -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' "$GUARD_DIR/" "$host:.local/state/cclimits/guard/"; } 2>/dev/null; then
+      echo "cclimits: could not copy the guard list to $host" >&2
+    fi
+  done
+  return 0
+}
+
+guard_notify() {
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$2\" with title \"cclimits guard: $1\" sound name \"Sosumi\"" >/dev/null 2>&1 || true
+  fi
+  echo "cclimits guard: $1 — $2"
+}
+
 load_accounts
 
 if $LIST_ACCOUNTS; then
@@ -1006,6 +1079,12 @@ if (( ACC_COUNT == 0 )); then
 fi
 
 state_migrate
+
+if $GUARD; then
+  collect_all
+  guard_update
+  exit 0
+fi
 
 if $WATCH; then
   # Runs until Ctrl-C, like watch(1)/tail -f — no time cap. Memory stays flat

@@ -1,0 +1,18 @@
+#!/bin/bash
+# cclimits-guard: Claude Code hook (UserPromptSubmit + PreToolUse) that refuses
+# work on an account `cclimits --guard` has blocked: at 100% of a plan limit
+# while the org's extra usage would bill every further request. The account is
+# the session's config dir name (~/.claude -> claude, ~/.claude-gatling ->
+# claude-gatling), matching cclimits' account names. A block lapses on its own
+# at the limit's reset time. Exit 2 refuses the prompt or the tool call and
+# shows the reason; to override, delete the block file it names.
+name=$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
+name=${name#.}
+f="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits/guard/$name"
+[[ -f "$f" ]] || exit 0
+IFS=$'\t' read -r until reason < "$f" || true
+[[ "$until" =~ ^[0-9]+$ ]] || exit 0
+(( $(date +%s) < until )) || exit 0
+cat > /dev/null
+echo "cclimits guard: $name is blocked until $(date -r "$until" '+%H:%M') — $reason. Stop here: every further request bills the organization's extra usage. (Override: rm $f)" >&2
+exit 2
