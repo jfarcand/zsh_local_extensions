@@ -1,7 +1,11 @@
 #!/bin/zsh
 # ccc: open a Claude Code tmux pane on 2Q84 from 1Q84.
-#   ccc            session menu; Enter starts a new work-account session
-#   ccc oss        same, but a new session is bound to the oss account
+#   ccc            reconnect this iTerm pane to the Claude conversation it
+#                  showed (by id, then name; resumed if no Claude runs it any
+#                  more), else the session menu
+#   ccc list       the session menu; Enter starts a new work-account session
+#   ccc new        a new work-account session, no menu
+#   ccc oss ...    same, but a new session is bound to the oss account
 #   ccc <n>        attach tmux session n directly
 #   ccc recover    open an iTerm tab for every Claude session on 2Q84 that no
 #                  live pane here is showing (after drops, sleep, a restart)
@@ -11,9 +15,11 @@
 # LC_CCC_KC env var (2Q84's sshd accepts LC_*), never argv; the remote side
 # unsets it before tmux starts. Without the item, 2Q84 prompts for it.
 # ~/.local/bin/ccc-tmux on 2Q84 does the rest; it tells a live pane from a
-# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS),
-# and remembers each iTerm pane's session (LC_CCC_PANE). When the connection
-# drops, ccc reconnects to the same session until Ctrl-C.
+# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS).
+# 2Q84 tags each iTerm pane with the conversation it shows (iTerm variable
+# user.cccClaude, set by ~/.local/bin/ccc-tag there, kept by iTerm after the
+# connection dies); ccc sends that tag (LC_CCC_CLAUDE) to reconnect by it.
+# When the connection drops, ccc reconnects until Ctrl-C.
 
 # Source ports of this Mac's established SSH connections
 live_ports() {
@@ -22,11 +28,24 @@ live_ports() {
     | sort -u | paste -sd, -
 }
 
+# This iTerm pane's cccClaude tag, base64 for the trip over SSH; empty when
+# the pane never showed a 2Q84 session
+pane_tag() {
+  local id=${ITERM_SESSION_ID#*:}
+  [[ -z "$id" ]] && return
+  osascript -e 'on run argv' -e 'tell application "iTerm2"' \
+    -e 'repeat with w in windows' -e 'repeat with t in tabs of w' -e 'repeat with s in sessions of t' \
+    -e 'if unique id of s is item 1 of argv then return (variable named "user.cccClaude") of s' \
+    -e 'end repeat' -e 'end repeat' -e 'end repeat' -e 'end tell' -e 'end run' "$id" 2>/dev/null \
+    | grep -v '^missing value$' | tr -d '\n' | base64
+}
+
 export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
-case "$1" in
-  ""|work) ;;
+for arg in "$@"; do case "$arg" in
+  work) ;;
   oss) LC_CCC_ACCOUNT=oss ;;
-  <->) LC_CCC_ATTACH=$1 ;;
+  list|new) LC_CCC_MODE=$arg ;;
+  <->) LC_CCC_ATTACH=$arg ;;
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
       -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp .local/bin/ccc-tmux \
@@ -39,12 +58,11 @@ case "$1" in
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
-  *) echo "usage: ccc [oss | <session> | recover]"; exit 1 ;;
-esac
+  *) echo "usage: ccc [list | new | <session> | recover] [oss]"; exit 1 ;;
+esac; done
 
 LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
-LC_CCC_PANE=${ITERM_SESSION_ID#*:}
-export LC_CCC_KC LC_CCC_PANE
+export LC_CCC_KC
 remote='
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
@@ -57,16 +75,16 @@ unset LC_CCC_KC
 exec $HOME/.local/bin/ccc-tmux
 '
 while true; do
-  LC_CCC_PORTS=$(live_ports)
-  export LC_CCC_PORTS
+  LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
+  export LC_CCC_PORTS LC_CCC_CLAUDE
   ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
-    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_PANE mbp "$remote"
+    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE mbp "$remote"
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
   (( rc == 0 || rc == 130 )) && exit $rc
-  # The pane's session is remembered on 2Q84, so reconnecting lands back in it
-  LC_CCC_ATTACH= LC_CCC_MODE=resume
+  # The pane's tag names the conversation, so reconnecting lands back in it
+  LC_CCC_ATTACH= LC_CCC_MODE=
   print -P "%F{yellow}Connection to 2Q84 lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
   sleep 5 || exit 0
 done
