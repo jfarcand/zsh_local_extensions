@@ -244,6 +244,9 @@ keychain_service_for_dir() {
   return 1
 }
 
+# The account's email, plus its organization when that is not the personal
+# default ("<email>'s Organization"): one email can hold several
+# subscriptions (Personal Max and a Team org), and only the org tells them apart.
 # The default config dir keeps its account file beside it (~/.claude.json);
 # a CLAUDE_CONFIG_DIR keeps it inside (<dir>/.claude.json).
 account_email() {
@@ -253,7 +256,10 @@ account_email() {
       continue
     fi
     if [[ -f "$f" ]]; then
-      jq -r '.oauthAccount.emailAddress // empty' "$f" 2>/dev/null || true
+      jq -r '.oauthAccount // {} | (.emailAddress // "") + (
+        (.organizationName // "") as $org
+        | if $org == "" or ($org | endswith("s Organization")) then "" else " · " + $org end
+      )' "$f" 2>/dev/null || true
       return 0
     fi
   done
@@ -769,7 +775,7 @@ render_columns() {
     err_shown[$i]=0
   done
 
-  # Two header lines: account name, then the email it belongs to.
+  # Two header lines: account name, then the email (and org) it belongs to.
   printf '%*s' "$LABEL_W" ''
   for (( i = 0; i < ACC_COUNT; i++ )); do
     (( i > 0 )) && printf '%*s' "$gap" ''
@@ -920,9 +926,15 @@ if $LIST_ACCOUNTS; then
     echo "cclimits: no logged-in Claude Code accounts found" >&2
     exit 1
   fi
+  # the email column fits its longest entry ("<email> · <org>" runs long)
+  w=24 i=0
+  while (( i < ACC_COUNT )); do
+    (( ${#ACC_EMAIL[$i]} > w )) && w=${#ACC_EMAIL[$i]}
+    i=$(( i + 1 ))
+  done
   i=0
   while (( i < ACC_COUNT )); do
-    printf "${BOLD}%-14s${RESET} %-20s %-24s ${DIM}%s${RESET}\n" \
+    printf "${BOLD}%-14s${RESET} %-20s %-${w}s ${DIM}%s${RESET}\n" \
       "${ACC_NAME[$i]}" "~${ACC_DIR[$i]#$HOME}" "${ACC_EMAIL[$i]:--}" "${ACC_SVC[$i]}"
     i=$(( i + 1 ))
   done
