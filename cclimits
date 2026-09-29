@@ -1107,7 +1107,6 @@ if $WATCH; then
     printf '\033[H\033[2J'
     show_status || true
     if $GUARD; then
-      echo
       guard_update || true
     fi
     printf "\n${DIM}refreshing every %ds%s — Ctrl-C to stop${RESET}\n" "$WATCH_INTERVAL" "$($GUARD && echo ', guarding')"
