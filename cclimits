@@ -19,7 +19,7 @@
 #                                # one silent pass, with -w it runs every refresh
 #
 # Guard: a plan past its limit does not stop Claude Code when the org has
-# extra usage on (Gatling's Team plan); sessions keep running and bill usage
+# extra usage on (a Team plan can); sessions keep running and bill usage
 # credits. --guard marks every account that is at 100% on a limit while extra
 # usage is on as blocked, in ~/.local/state/cclimits/guard/<account> ("<reset
 # epoch>\t<reason>"), clears it once the account is back under, notifies on

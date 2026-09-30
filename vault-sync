@@ -35,7 +35,7 @@ if [[ -z "${SSH_AUTH_SOCK:-}" ]] && command -v launchctl >/dev/null 2>&1; then
   [[ -n "$_sock" ]] && export SSH_AUTH_SOCK="$_sock"
 fi
 
-AGENT_LABEL="com.jfarcand.vault-sync"
+AGENT_LABEL="${VAULT_SYNC_LABEL:-local.vault-sync}"
 PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vault-sync"
 LOG_FILE="$STATE_DIR/vault-sync.log"

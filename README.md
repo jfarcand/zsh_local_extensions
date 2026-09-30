@@ -18,34 +18,38 @@ arguments they need; the header comment of each script is its documentation.
 
 ## Claude Code across two Macs
 
-Claude Code sessions run on **2Q84** inside tmux; they are driven from **1Q84**
-over SSH, so a dropped connection never loses a session.
+Claude Code sessions run on a **remote Mac** inside tmux; they are driven from
+**this Mac** over SSH, so a dropped connection never loses a session. The remote
+Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
+`CCC_HOST`), with a second host `ccc-remote-fwd` carrying the port forwards.
 
 | Command | What it does |
 |---|---|
 | `ccc` | Reconnect this iTerm pane to the Claude conversation it showed (found by id, then name; resumed with `claude --resume` if no Claude runs it any more), otherwise show the session menu: account, bilan, state, whether a pane here shows it, title. Reconnects on its own when the connection drops. |
-| `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. Add `oss` or `gatling` to bind a new session to that Claude account. |
-| `ccc recover` | Open an iTerm tab for every Claude session on 2Q84 that no pane here shows. |
-| `tunnel [port…]` | Forward localhost ports to 2Q84 until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` on 2Q84. |
-| `ssh-mbp-fwd` | The connection behind the `local.ssh-mbp-fwd` LaunchAgent: 2Q84's dev ports (18081/15173/18082), gcloud's 8085, and the URL-back channel. |
-| `clip2q84` | Runs under the `local.clip2q84` LaunchAgent: copies every image put on 1Q84's clipboard to 2Q84's, so pasting in Claude there works. |
-| `cclimits` | Usage limits of every logged-in Claude account, side by side, with alerts; shows the org (`· Gatling`) and any extra-usage spend. `cclimits -w 120` watches. |
-| `cclimits -g` | Guard: blocks an account that is at 100% of a limit while its org's extra usage would bill every further request. Alone it runs one silent pass (the `local.cclimits-guard` LaunchAgent, every 5 min); with `-w` it guards on each refresh. |
+| `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. Add an account name to bind a new session to it: `oss` is `~/.claude-perso`, any other name `x` is `~/.claude-x`. |
+| `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
+| `tunnel [port…]` | Forward localhost ports to the remote Mac until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
+| `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |
+| `clip-to-remote` | Runs under the `local.clip-to-remote` LaunchAgent: copies every image put on this Mac's clipboard to the remote Mac's, so pasting in Claude there works. |
+| `cclimits` | Usage limits of every logged-in Claude account, side by side, with alerts; shows a Team account's organization and any extra-usage spend. `cclimits -w 120` watches. |
+| `cclimits -g` | Guard: blocks an account that is at 100% of a limit while its org's extra usage would bill every further request. Alone it runs one silent pass (the `local.cclimits-guard` LaunchAgent, every 5 min); with `-w` it guards on each refresh. `CCLIMITS_GUARD_HOSTS` lists the ssh hosts that get the block list. |
 | `cclimits-guard` | The Claude Code hook (UserPromptSubmit + PreToolUse) that refuses prompts and tool calls for a blocked account. |
 
-Claude accounts are config dirs selected by aliases in `~/.zshrc`: `claude`
-(`~/.claude`), `claude-oss` (`~/.claude-perso`), `claude-gatling`
-(`~/.claude-gatling`). They share everything through symlinks except the login.
+Claude accounts are config dirs, each selected by an alias that sets
+`CLAUDE_CONFIG_DIR` (`~/.claude` is the default account). They share everything
+through symlinks except the login.
 
 Pieces that live outside this repo:
 
-- **2Q84** `~/.local/bin`: `ccc-tmux` (the session menu and reconnect logic),
-  `ccc-tag` (tags each iTerm pane with its conversation), `clip-set-png`,
-  `cclimits-guard` (copy of the hook); `~/.tmux.conf`; the SSH block in `~/.zshrc`.
+- **Remote Mac** `~/.local/bin`: `ccc-tmux` (the session menu and reconnect
+  logic), `ccc-tag` (tags each iTerm pane with its conversation),
+  `clip-set-png`, `cclimits-guard` (copy of the hook); `~/.tmux.conf`; the SSH
+  block in `~/.zshrc`; a `caffeinate` LaunchAgent.
 - **Both Macs** `~/.claude/settings.json`: the `ccc-tag` and `cclimits-guard` hooks.
-- **1Q84** `~/Library/LaunchAgents`: `local.url-listener`, `local.ssh-mbp-fwd`,
-  `local.clip2q84`, `local.cclimits-guard`; **2Q84**: `local.caffeinate`.
-- **1Q84** keychain item `2Q84-login`, which `ccc` uses to unlock 2Q84's keychain.
+- **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
+  `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`.
+- **This Mac** keychain item `ccc-remote-login` (or `$CCC_KEYCHAIN_ITEM`), which
+  `ccc` uses to unlock the remote login keychain.
 
 ## GitHub
 

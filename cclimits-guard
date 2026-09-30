@@ -2,8 +2,8 @@
 # cclimits-guard: Claude Code hook (UserPromptSubmit + PreToolUse) that refuses
 # work on an account `cclimits --guard` has blocked: at 100% of a plan limit
 # while the org's extra usage would bill every further request. The account is
-# the session's config dir name (~/.claude -> claude, ~/.claude-gatling ->
-# claude-gatling), matching cclimits' account names. A block lapses on its own
+# the session's config dir name (~/.claude -> claude, ~/.claude-team ->
+# claude-team), matching cclimits' account names. A block lapses on its own
 # at the limit's reset time. Exit 2 refuses the prompt or the tool call and
 # shows the reason; to override, delete the block file it names.
 name=$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")

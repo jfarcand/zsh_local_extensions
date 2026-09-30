@@ -1,26 +1,31 @@
 #!/bin/zsh
-# ccc: open a Claude Code tmux pane on 2Q84 from 1Q84.
+# ccc: open a Claude Code tmux pane on the remote Mac (ssh alias ccc-remote,
+# or $CCC_HOST) from this one.
 #   ccc            reconnect this iTerm pane to the Claude conversation it
 #                  showed (by id, then name; resumed if no Claude runs it any
 #                  more), else the session menu
 #   ccc list       the session menu; Enter starts a new work-account session
 #   ccc new        a new work-account session, no menu
-#   ccc oss ...    same, but a new session is bound to the oss account
-#   ccc gatling .. same, bound to the Gatling Team account (~/.claude-gatling)
+#   ccc <account>  with list/new: bind a new session to Claude account
+#                  <account> (oss -> ~/.claude-perso, any other name ->
+#                  ~/.claude-<account> on the remote Mac)
 #   ccc <n>        attach tmux session n directly
-#   ccc recover    open an iTerm tab for every Claude session on 2Q84 that no
-#                  live pane here is showing (after drops, sleep, a restart)
-# Unlocks 2Q84's login keychain first: every SSH session starts with it locked
-# (the unlock is per session), which makes claude report "Not logged in".
-# The password comes from 1Q84's keychain item "2Q84-login" and rides in the
-# LC_CCC_KC env var (2Q84's sshd accepts LC_*), never argv; the remote side
-# unsets it before tmux starts. Without the item, 2Q84 prompts for it.
-# ~/.local/bin/ccc-tmux on 2Q84 does the rest; it tells a live pane from a
-# stale one by the source ports of this Mac's SSH connections (LC_CCC_PORTS).
-# 2Q84 tags each iTerm pane with the conversation it shows (iTerm variable
-# user.cccClaude, set by ~/.local/bin/ccc-tag there, kept by iTerm after the
-# connection dies); ccc sends that tag (LC_CCC_CLAUDE) to reconnect by it.
-# When the connection drops, ccc reconnects until Ctrl-C.
+#   ccc recover    open an iTerm tab for every Claude session on the remote
+#                  Mac that no live pane here is showing (after drops, sleep,
+#                  a restart)
+# Unlocks the remote login keychain first: every SSH session starts with it
+# locked (the unlock is per session), which makes claude report "Not logged
+# in". The password comes from this Mac's keychain item $CCC_KEYCHAIN_ITEM
+# (default "ccc-remote-login") and rides in the LC_CCC_KC env var (the remote
+# sshd accepts LC_*), never argv; the remote side unsets it before tmux starts.
+# Without the item, the remote Mac prompts for it.
+# ~/.local/bin/ccc-tmux on the remote Mac does the rest; it tells a live pane
+# from a stale one by the source ports of this Mac's SSH connections
+# (LC_CCC_PORTS). The remote Mac tags each iTerm pane with the conversation it
+# shows (iTerm variable user.cccClaude, set by ~/.local/bin/ccc-tag there, kept
+# by iTerm after the connection dies); ccc sends that tag (LC_CCC_CLAUDE) to
+# reconnect by it. When the connection drops, ccc reconnects until Ctrl-C.
+host=${CCC_HOST:-ccc-remote}
 
 # Source ports of this Mac's established SSH connections
 live_ports() {
@@ -30,7 +35,7 @@ live_ports() {
 }
 
 # This iTerm pane's cccClaude tag, base64 for the trip over SSH; empty when
-# the pane never showed a 2Q84 session
+# the pane never showed a remote session
 pane_tag() {
   local id=${ITERM_SESSION_ID#*:}
   [[ -z "$id" ]] && return
@@ -44,12 +49,11 @@ pane_tag() {
 export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
 for arg in "$@"; do case "$arg" in
   work) ;;
-  oss|gatling) LC_CCC_ACCOUNT=$arg ;;
   list|new) LC_CCC_MODE=$arg ;;
   <->) LC_CCC_ATTACH=$arg ;;
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
-      -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE mbp .local/bin/ccc-tmux \
+      -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE $host .local/bin/ccc-tmux \
       | while IFS=$'\t' read -r n acct state here bilan title; do
           [[ "$state" == shell || "$here" == yes ]] && continue
           echo "Reopening session $n ($acct, bilan $bilan, $state): $title"
@@ -59,20 +63,21 @@ for arg in "$@"; do case "$arg" in
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
-  *) echo "usage: ccc [list | new | <session> | recover] [oss | gatling]"; exit 1 ;;
+  [a-z]*([a-z0-9-])) LC_CCC_ACCOUNT=$arg ;;
+  *) echo "usage: ccc [list | new | <session> | recover] [<account>]"; exit 1 ;;
 esac; done
 
-LC_CCC_KC=$(security find-generic-password -a "$USER" -s 2Q84-login -w 2>/dev/null)
+LC_CCC_KC=$(security find-generic-password -a "$USER" -s "${CCC_KEYCHAIN_ITEM:-ccc-remote-login}" -w 2>/dev/null)
 export LC_CCC_KC
 
-# 2Q84 paints the pane in its tmux session's colour on attach; leaving ccc
+# The remote Mac paints the pane in its tmux session's colour on attach; leaving ccc
 # gives the pane its own colours back
 reset_colours() { printf '\033]6;1;bg;*;default\a\033]111\a' }
 remote='
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
   if [ -z "$LC_CCC_KC" ] || ! printf "unlock-keychain -p %s %s\n" "$(printf %q "$LC_CCC_KC")" "$kc" | security -i >/dev/null 2>&1; then
-    echo "2Q84 login keychain is locked; unlocking it for Claude Code."
+    echo "The remote login keychain is locked; unlocking it for Claude Code."
     security unlock-keychain "$kc" || exit 1
   fi
 fi
@@ -83,13 +88,13 @@ while true; do
   LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
   export LC_CCC_PORTS LC_CCC_CLAUDE
   ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
-    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE mbp "$remote"
+    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE $host "$remote"
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
   (( rc == 0 || rc == 130 )) && { reset_colours; exit $rc }
   # The pane's tag names the conversation, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE=
-  print -P "%F{yellow}Connection to 2Q84 lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
+  print -P "%F{yellow}Connection to $host lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
   sleep 5 || { reset_colours; exit 0 }
 done

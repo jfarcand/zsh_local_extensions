@@ -97,10 +97,8 @@ ensure_config_dir() {
 seed_defaults() {
   if [[ ! -f "${REPOS_CONF}" ]]; then
     cat > "${REPOS_CONF}" <<'EOF'
-dravr-ai/dravr-embacle
-Atmosphere/atmosphere
-jfarcand/iphone-mirroir-mcp
-jfarcand/mirroir-skills
+# One owner/repo (or GitHub URL) per line, for example:
+# torvalds/linux
 EOF
   fi
 }

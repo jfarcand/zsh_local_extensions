@@ -1,17 +1,19 @@
 #!/usr/bin/osascript -l JavaScript
-// clip2q84: copy every image put on 1Q84's clipboard to 2Q84's clipboard, so
-// pasting it in Claude Code running on 2Q84 (over ccc) works. Universal
-// Clipboard does not deliver reliably while 2Q84's screen sleeps or is locked.
-// Runs under the local.clip2q84 LaunchAgent; 2Q84's ~/.local/bin/clip-set-png
+// clip-to-remote: copy every image put on this Mac's clipboard to the remote
+// Mac's clipboard (ssh alias ccc-remote, or $CCC_HOST), so pasting it in
+// Claude Code running there (over ccc) works. Universal Clipboard does not
+// deliver reliably while the remote Mac's screen sleeps or is locked.
+// Runs under the local.clip-to-remote LaunchAgent; the remote ~/.local/bin/clip-set-png
 // receives the PNG on stdin. Text is left alone: the terminal pastes it.
 ObjC.import('AppKit');
 
 const app = Application.currentApplication();
 app.includeStandardAdditions = true;
 const pasteboard = $.NSPasteboard.generalPasteboard;
-const png = $.NSTemporaryDirectory().js + 'clip2q84.png';
+const png = $.NSTemporaryDirectory().js + 'clip-to-remote.png';
+const host = $.NSProcessInfo.processInfo.environment.objectForKey('CCC_HOST').js || 'ccc-remote';
 let last = pasteboard.changeCount;
-// Universal Clipboard can echo 2Q84's copy back here; never resend the same image
+// Universal Clipboard can echo the remote copy back here; never resend the same image
 let sent = null;
 
 // PNG bytes of the clipboard image, converting TIFF (screenshots, many apps)
@@ -35,8 +37,8 @@ while (true) {
   data.writeToFileAtomically(png, true);
   try {
     app.doShellScript(
-      "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 mbp .local/bin/clip-set-png < '" + png + "'");
+      "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 " + host + " .local/bin/clip-set-png < '" + png + "'");
   } catch (e) {
-    console.log('clip2q84: 2Q84 unreachable, image not sent: ' + e);
+    console.log('clip-to-remote: ' + host + ' unreachable, image not sent: ' + e);
   }
 }

@@ -1,0 +1,11 @@
+#!/bin/zsh
+# ccc-forward: the connection behind the local.ccc-forward LaunchAgent,
+# carrying every forward between this Mac and the remote Mac (see the
+# ccc-remote-fwd host in ~/.ssh/config; $CCC_HOST overrides ccc-remote). A
+# connection that died while the remote Mac slept leaves its sshd holding
+# 127.0.0.1:17777 there, so every restart failed to bind; the stale holder is
+# ended first. Only a previous forwarder binds that port.
+host=${CCC_HOST:-ccc-remote}
+ssh -o BatchMode=yes -o ConnectTimeout=10 $host \
+  'pid=$(lsof -t -nP -iTCP@127.0.0.1:17777 -sTCP:LISTEN 2>/dev/null); [ -n "$pid" ] && kill $pid; true'
+exec /usr/bin/ssh -N -o BatchMode=yes $host-fwd
