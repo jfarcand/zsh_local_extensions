@@ -27,6 +27,8 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 |---|---|
 | `ccc` | Reconnect this iTerm pane to the Claude conversation it showed (found by id, then name; resumed with `claude --resume` if no Claude runs it any more), otherwise show the session menu: account, bilan, state, whether a pane here shows it, title. Reconnects on its own when the connection drops. |
 | `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. Add an account name to bind a new session to it: `oss` is `~/.claude-perso`, any other name `x` is `~/.claude-x`. |
+| `ccc switch <account>` | Resume this pane's conversation on another account, in a fresh session (exit Claude first). |
+| `ccc resume <id> [<account>]` | Reattach, or resume, a saved conversation by id or id prefix, e.g. one no pane shows any more. |
 | `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
 | `tunnel [port…]` | Forward localhost ports to the remote Mac until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
 | `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |

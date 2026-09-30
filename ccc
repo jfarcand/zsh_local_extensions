@@ -9,6 +9,11 @@
 #   ccc <account>  with list/new: bind a new session to Claude account
 #                  <account> (oss -> ~/.claude-perso, any other name ->
 #                  ~/.claude-<account> on the remote Mac)
+#   ccc switch <account>  resume this pane's conversation on another account,
+#                  in a fresh session (exit Claude first: one conversation,
+#                  one running Claude)
+#   ccc resume <id> [<account>]  reattach, or resume, a saved conversation by
+#                  id or id prefix (e.g. one no pane shows any more)
 #   ccc <n>        attach tmux session n directly
 #   ccc recover    open an iTerm tab for every Claude session on the remote
 #                  Mac that no live pane here is showing (after drops, sleep,
@@ -46,10 +51,16 @@ pane_tag() {
     | grep -v '^missing value$' | tr -d '\n' | base64
 }
 
-export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE=
+export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
+account_given=false
+if [[ "$1" == resume ]]; then
+  [[ -n "$2" ]] || { echo "usage: ccc resume <conversation id or prefix> [<account>]"; exit 1; }
+  LC_CCC_MODE=resume LC_CCC_RESUME=$2
+  shift 2
+fi
 for arg in "$@"; do case "$arg" in
-  work) ;;
-  list|new) LC_CCC_MODE=$arg ;;
+  work) account_given=true ;;
+  list|new|switch) LC_CCC_MODE=$arg ;;
   <->) LC_CCC_ATTACH=$arg ;;
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
@@ -63,9 +74,13 @@ for arg in "$@"; do case "$arg" in
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;
-  [a-z]*([a-z0-9-])) LC_CCC_ACCOUNT=$arg ;;
-  *) echo "usage: ccc [list | new | <session> | recover] [<account>]"; exit 1 ;;
+  [a-z]*([a-z0-9-])) LC_CCC_ACCOUNT=$arg account_given=true ;;
+  *) echo "usage: ccc [list | new | switch | <session> | recover] [<account>]"; exit 1 ;;
 esac; done
+if [[ "$LC_CCC_MODE" == switch ]] && ! $account_given; then
+  echo "usage: ccc switch <account>   (work, oss, or the x of ~/.claude-x)"
+  exit 1
+fi
 
 LC_CCC_KC=$(security find-generic-password -a "$USER" -s "${CCC_KEYCHAIN_ITEM:-ccc-remote-login}" -w 2>/dev/null)
 export LC_CCC_KC
@@ -88,13 +103,13 @@ while true; do
   LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
   export LC_CCC_PORTS LC_CCC_CLAUDE
   ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
-    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE $host "$remote"
+    -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE -o SendEnv=LC_CCC_RESUME $host "$remote"
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
   (( rc == 0 || rc == 130 )) && { reset_colours; exit $rc }
   # The pane's tag names the conversation, so reconnecting lands back in it
-  LC_CCC_ATTACH= LC_CCC_MODE=
+  LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
   print -P "%F{yellow}Connection to $host lost; reconnecting in 5 s (Ctrl-C to stop)...%f"
   sleep 5 || { reset_colours; exit 0 }
 done
