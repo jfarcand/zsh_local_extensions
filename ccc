@@ -82,8 +82,6 @@ if [[ "$LC_CCC_MODE" == switch ]] && ! $account_given; then
   exit 1
 fi
 
-LC_CCC_KC=$(security find-generic-password -a "$USER" -s "${CCC_KEYCHAIN_ITEM:-ccc-remote-login}" -w 2>/dev/null)
-export LC_CCC_KC
 
 # The remote Mac paints the pane in its tmux session's colour on attach; leaving ccc
 # gives the pane its own colours back
@@ -108,8 +106,10 @@ unset LC_CCC_KC
 exec $HOME/.local/bin/ccc-tmux
 '
 while true; do
+  # read on every attempt, so an item added after this pane started is used
+  LC_CCC_KC=$(security find-generic-password -a "$USER" -s "${CCC_KEYCHAIN_ITEM:-ccc-remote-login}" -w 2>/dev/null)
   LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
-  export LC_CCC_PORTS LC_CCC_CLAUDE
+  export LC_CCC_KC LC_CCC_PORTS LC_CCC_CLAUDE
   ssh -t -o ConnectTimeout=10 -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
     -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE -o SendEnv=LC_CCC_RESUME $host "$remote"
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
