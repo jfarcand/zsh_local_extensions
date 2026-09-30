@@ -1,0 +1,18 @@
+#!/bin/bash
+# rtk-claude-hook: run rtk's Claude Code hook only for chosen Claude accounts.
+# Registered as a PreToolUse(Bash) hook with the real hook as its arguments:
+#   rtk-claude-hook /opt/homebrew/bin/rtk hook claude
+# A session whose config dir name (~/.claude
+# -> claude, ~/.claude-x -> claude-x) is listed, one per line, in
+# ~/.config/rtk/claude-accounts gets the hook; every other session passes
+# through untouched, since the accounts share one settings.json.
+name=$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
+name=${name#.}
+list="${XDG_CONFIG_HOME:-$HOME/.config}/rtk/claude-accounts"
+if [[ -f "$list" ]] && grep -qxF "$name" "$list"; then
+  # rtk's own install check looks for the bare command and would warn on
+  # every call; the hook is installed, just behind this wrapper
+  RTK_SUPPRESS_HOOK_WARNING=1 exec "$@"
+fi
+cat > /dev/null
+exit 0

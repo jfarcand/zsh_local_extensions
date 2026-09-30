@@ -34,6 +34,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `cclimits` | Usage limits of every logged-in Claude account, side by side, with alerts; shows a Team account's organization and any extra-usage spend. `cclimits -w 120` watches. |
 | `cclimits -g` | Guard: blocks an account that is at 100% of a limit while its org's extra usage would bill every further request. Alone it runs one silent pass (the `local.cclimits-guard` LaunchAgent, every 5 min); with `-w` it guards on each refresh. `CCLIMITS_GUARD_HOSTS` lists the ssh hosts that get the block list. |
 | `cclimits-guard` | The Claude Code hook (UserPromptSubmit + PreToolUse) that refuses prompts and tool calls for a blocked account. |
+| `rtk-claude-hook` | Runs [rtk](https://github.com/rtk-ai/rtk)'s Claude Code hook (condensed command output, fewer tokens) only for the accounts listed in `~/.config/rtk/claude-accounts`; the other accounts share the same `settings.json` untouched. `rtk gain` shows the savings. |
 
 Claude accounts are config dirs, each selected by an alias that sets
 `CLAUDE_CONFIG_DIR` (`~/.claude` is the default account). They share everything
@@ -45,7 +46,7 @@ Pieces that live outside this repo:
   logic), `ccc-tag` (tags each iTerm pane with its conversation),
   `clip-set-png`, `cclimits-guard` (copy of the hook); `~/.tmux.conf`; the SSH
   block in `~/.zshrc`; a `caffeinate` LaunchAgent.
-- **Both Macs** `~/.claude/settings.json`: the `ccc-tag` and `cclimits-guard` hooks.
+- **Both Macs** `~/.claude/settings.json`: the `ccc-tag`, `cclimits-guard` and `rtk-claude-hook` hooks; `~/.config/rtk/claude-accounts`; an rtk account's own `CLAUDE.md` importing the shared one plus `@RTK.md`.
 - **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
   `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`.
 - **This Mac** keychain item `ccc-remote-login` (or `$CCC_KEYCHAIN_ITEM`), which
