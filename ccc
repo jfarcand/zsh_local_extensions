@@ -88,6 +88,14 @@ export LC_CCC_KC
 # The remote Mac paints the pane in its tmux session's colour on attach; leaving ccc
 # gives the pane its own colours back
 reset_colours() { printf '\033]6;1;bg;*;default\a\033]111\a' }
+
+# tmux and Claude Code switch the terminal into extended-key, mouse,
+# focus-event and bracketed-paste modes; a connection that dies abruptly never
+# switches them back, and Ctrl-C then arrives as ESC[27;5;99~ that nothing
+# here reads as an interrupt. Put the terminal back after every connection.
+reset_terminal() {
+  printf '\033[>4;0m\033[<u\033[?1004l\033[?2004l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h'
+}
 remote='
 kc=$HOME/Library/Keychains/login.keychain-db
 if ! security show-keychain-info "$kc" >/dev/null 2>&1; then
@@ -102,11 +110,12 @@ exec $HOME/.local/bin/ccc-tmux
 while true; do
   LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
   export LC_CCC_PORTS LC_CCC_CLAUDE
-  ssh -t -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
+  ssh -t -o ConnectTimeout=10 -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
     -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE -o SendEnv=LC_CCC_CLAUDE -o SendEnv=LC_CCC_RESUME $host "$remote"
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
+  reset_terminal
   (( rc == 0 || rc == 130 )) && { reset_colours; exit $rc }
   # The pane's tag names the conversation, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
