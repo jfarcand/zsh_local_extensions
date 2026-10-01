@@ -673,6 +673,7 @@ rows_from_json() {
 # Extra usage: the credits an org spends once a plan limit is reached (a Team
 # plan keeps sessions running past 100% on them). "<CUR> <amount> used", plus
 # ", limit reached" when the org's spend cap is hit; empty when it is off.
+# The Extra usage row shows only once credits are spent (extra_shown).
 # ASCII currency codes on purpose: the column renderer pads by bytes.
 # extra_amount_from_json prints the total alone (a number), empty when off.
 extra_amount_from_json() {
@@ -697,6 +698,15 @@ extra_today() {
     base=$amount
   fi
   awk -v a="$amount" -v b="$base" 'BEGIN { printf "%.2f", a - b }'
+}
+
+# The Extra usage row of account i: empty until it has spent credits, so an
+# org that merely has extra usage switched on adds no noise.
+extra_shown() {
+  local amount
+  amount=$(cat "${ACC_EXTRA[$1]%.extra}.extra_amt" 2>/dev/null || true)
+  awk -v a="${amount:-0}" 'BEGIN { exit !(a > 0) }' || return 0
+  cat "${ACC_EXTRA[$1]}" 2>/dev/null || true
 }
 
 extra_from_json() {
@@ -781,9 +791,15 @@ collect_all() {
       rows_from_json "$USAGE_JSON" > "$RUN_DIR/rows.$i"
       amount=$(extra_amount_from_json "$USAGE_JSON")
       printf '%s\n' "$amount" > "$base.extra_amt"
+      # a non-empty .extra is what tells the guard extra usage is on, so it is
+      # written even at zero spend; "today" only matters against a daily cap
       if [[ -n "$amount" ]]; then
-        printf '%s · today %s%s\n' "$(extra_from_json "$USAGE_JSON")" \
-          "$(extra_today "${ACC_NAME[$i]}" "$amount")" "${CCLIMITS_EXTRA_DAILY_CAP:+/$CCLIMITS_EXTRA_DAILY_CAP}" > "$base.extra"
+        if [[ -n "${CCLIMITS_EXTRA_DAILY_CAP:-}" ]]; then
+          printf '%s · today %s/%s\n' "$(extra_from_json "$USAGE_JSON")" \
+            "$(extra_today "${ACC_NAME[$i]}" "$amount")" "$CCLIMITS_EXTRA_DAILY_CAP" > "$base.extra"
+        else
+          extra_from_json "$USAGE_JSON" > "$base.extra"
+        fi
       else
         : > "$base.extra"
       fi
@@ -856,8 +872,7 @@ render_stacked() {
         [[ -n "$key" ]] || continue
         print_limit "$label" "$pct" "$epoch" "${ACC_STALE[$i]}"
       done < "${ACC_SRC[$i]}"
-      # no file until an account's first good fetch; set -e must not see that
-      extra=$(cat "${ACC_EXTRA[$i]}" 2>/dev/null || true)
+      extra=$(extra_shown "$i")
       if [[ -n "$extra" ]]; then
         printf "${BOLD}%-22s${RESET} ${YELLOW}%s${RESET}\n" "Extra usage" "$extra"
       fi
@@ -932,7 +947,7 @@ render_columns() {
 
   local extras=() any=false
   for (( i = 0; i < ACC_COUNT; i++ )); do
-    extras[$i]=$(cat "${ACC_EXTRA[$i]}" 2>/dev/null || true)
+    extras[$i]=$(extra_shown "$i")
     if [[ -n "${extras[$i]}" ]]; then any=true; fi
   done
   if $any; then
