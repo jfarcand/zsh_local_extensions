@@ -24,9 +24,12 @@
 # usage is on as blocked, in ~/.local/state/cclimits/guard/<account> ("<reset
 # epoch>\t<reason>"), clears it once the account is back under, notifies on
 # both, and copies the list to each host in CCLIMITS_GUARD_HOSTS (ssh names).
-# With CCLIMITS_EXTRA_DAILY_CAP=N (in the account's currency), an account past
-# its limit is allowed to spend up to N of extra usage per day before the block
-# (today's spend is the running total minus the day's first reading).
+# With a number N in ~/.config/cclimits/extra-daily-cap (the account's
+# currency), an account past its limit is allowed to spend up to N of extra
+# usage per day before the block (today's spend is the running total minus the
+# day's first reading). A file, read on every pass, rather than an environment
+# variable: a watch started in an old shell would otherwise keep an old cap and
+# lift blocks that every other guard sets. No file, no allowance.
 # The cclimits-guard Claude Code hook refuses prompts and tool calls for a
 # blocked account on every Mac that has the list. The local.cclimits-guard
 # LaunchAgent runs --guard every 5 minutes.
@@ -681,6 +684,15 @@ extra_amount_from_json() {
     | (.used_credits // 0) / pow(10; .decimal_places // 2)' 2>/dev/null || true
 }
 
+# The daily extra-usage allowance, read fresh on every pass; empty when none is
+# set (or the file holds no number), which blocks at the limit itself.
+daily_cap() {
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/cclimits/extra-daily-cap" v=""
+  [[ -f "$f" ]] && read -r v < "$f" || true
+  [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s\n' "$v"
+  return 0
+}
+
 # Today's extra-usage spend of an account (the endpoint only reports a running
 # total): the first reading of each day is the baseline, kept in
 # $STATE_DIR/extra-day/<account> as "<YYYY-MM-DD>\t<baseline>"; a total below
@@ -744,7 +756,7 @@ use_cache() {
 # ones when the fetch failed. ACC_STALE[i] is 0 for fresh, the epoch the cached
 # rows were fetched at when stale, and -1 when there is nothing to show at all.
 collect_all() {
-  local i=0 budget now base cooldown cd_token tok_exp left fresh amount
+  local i=0 budget now base cooldown cd_token tok_exp left fresh amount cap
   # a guard pass runs every few minutes, so it gets a watch-sized budget too
   if $WATCH || $GUARD; then
     budget=$(( WATCH_INTERVAL / ACC_COUNT ))
@@ -794,9 +806,10 @@ collect_all() {
       # a non-empty .extra is what tells the guard extra usage is on, so it is
       # written even at zero spend; "today" only matters against a daily cap
       if [[ -n "$amount" ]]; then
-        if [[ -n "${CCLIMITS_EXTRA_DAILY_CAP:-}" ]]; then
+        cap=$(daily_cap)
+        if [[ -n "$cap" ]]; then
           printf '%s · today %s/%s\n' "$(extra_from_json "$USAGE_JSON")" \
-            "$(extra_today "${ACC_NAME[$i]}" "$amount")" "$CCLIMITS_EXTRA_DAILY_CAP" > "$base.extra"
+            "$(extra_today "${ACC_NAME[$i]}" "$amount")" "$cap" > "$base.extra"
         else
           extra_from_json "$USAGE_JSON" > "$base.extra"
         fi
@@ -1062,7 +1075,7 @@ show_status() {
 # no numbers this cycle keeps its previous state; the hook itself lets a block
 # lapse at its reset time, so a stale block cannot outlive the window.
 guard_update() {
-  local i order key label pct epoch extra until reason f was amount spent midnight
+  local i order key label pct epoch extra until reason f was amount spent midnight cap
   mkdir -p "$GUARD_DIR"
   for (( i = 0; i < ACC_COUNT; i++ )); do
     [[ -n "${ACC_SRC[$i]}" ]] || continue
@@ -1080,18 +1093,19 @@ guard_update() {
     # With a daily cap, an account past its limit may keep spending extra usage
     # until today's spend reaches the cap; a block then lasts until the limit
     # resets (back on the plan) or midnight (a fresh day's allowance)
-    if (( until > 0 )) && [[ -n "${CCLIMITS_EXTRA_DAILY_CAP:-}" ]]; then
+    cap=$(daily_cap)
+    if (( until > 0 )) && [[ -n "$cap" ]]; then
       amount=$(cat "${ACC_EXTRA[$i]%.extra}.extra_amt" 2>/dev/null || true)
       # no reading of the running total (numbers cached before one existed):
       # today's spend is unknown, so the account stays blocked at its limit
       spent=""
       [[ "$amount" =~ ^[0-9.]+$ ]] && spent=$(extra_today "${ACC_NAME[$i]}" "$amount")
-      if [[ -n "$spent" ]] && awk -v s="$spent" -v c="$CCLIMITS_EXTRA_DAILY_CAP" 'BEGIN { exit !(s < c) }'; then
+      if [[ -n "$spent" ]] && awk -v s="$spent" -v c="$cap" 'BEGIN { exit !(s < c) }'; then
         until=0
       else
         midnight=$(date -v+1d -v0H -v0M -v0S +%s)
         (( midnight < until )) && until=$midnight
-        reason="$reason; today's extra usage ${spent:-unknown} reached the daily cap of ${CCLIMITS_EXTRA_DAILY_CAP}"
+        reason="$reason; today's extra usage ${spent:-unknown} reached the daily cap of ${cap}"
       fi
     fi
     was=false; [[ -f "$f" ]] && was=true
