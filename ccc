@@ -12,7 +12,7 @@
 #   ccc switch <account>  resume this pane's conversation on another account,
 #                  in a fresh session (exit Claude first: one conversation,
 #                  one running Claude)
-#   ccc resume <id> [<account>]  reattach, or resume, a saved conversation by
+#   ccc [resume] <id> [<account>]  reattach, or resume, a saved conversation by
 #                  id or id prefix (e.g. one no pane shows any more)
 #   ccc <n>        attach tmux session n directly
 #   ccc recover    open an iTerm tab for every Claude session on the remote
@@ -51,15 +51,24 @@ pane_tag() {
     | grep -v '^missing value$' | tr -d '\n' | base64
 }
 
-export LC_CCC_ACCOUNT=work LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
+# LC_CCC_ACCOUNT stays empty unless named, so the remote can tell a chosen
+# account from the default (work)
+export LC_CCC_ACCOUNT= LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
 account_given=false
 if [[ "$1" == resume ]]; then
   [[ -n "$2" ]] || { echo "usage: ccc resume <conversation id or prefix> [<account>]"; exit 1; }
   LC_CCC_MODE=resume LC_CCC_RESUME=$2
   shift 2
 fi
-for arg in "$@"; do case "$arg" in
-  work) account_given=true ;;
+for arg in "$@"; do
+  # a conversation id or its prefix (6+ hex characters, not a session number)
+  # is `resume <id>`; checked first, since it also fits the account pattern
+  if [[ "$arg" =~ '^[0-9a-f-]{6,}$' && "$arg" == *[0-9]* && "$arg" == *[a-f-]* ]]; then
+    LC_CCC_MODE=resume LC_CCC_RESUME=$arg
+    continue
+  fi
+  case "$arg" in
+  work) LC_CCC_ACCOUNT=work account_given=true ;;
   list|new|switch) LC_CCC_MODE=$arg ;;
   <->) LC_CCC_ATTACH=$arg ;;
   recover)
