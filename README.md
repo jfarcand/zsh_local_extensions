@@ -32,7 +32,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
 | `tunnel [port…]` | Forward localhost ports to the remote Mac until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
 | `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |
-| `clip-to-remote` | Runs under the `local.clip-to-remote` LaunchAgent: copies every image put on this Mac's clipboard to the remote Mac's, so pasting in Claude there works. |
+| `clip-to-remote` | Runs under the `local.clip-to-remote` LaunchAgent: copies every image and text put on this Mac's clipboard to the remote Mac's, so pasting in Claude there works; text a password manager marks concealed stays here. |
 | `cclimits` | Usage limits of every logged-in Claude account, side by side, with alerts; shows a Team account's organization and any extra-usage spend. `cclimits -w 120` watches. |
 | `cclimits -g` | Guard: blocks an account that is at 100% of a limit while its org's extra usage would bill every further request. Alone it runs one silent pass (the `local.cclimits-guard` LaunchAgent, every 5 min); with `-w` it guards on each refresh. `CCLIMITS_GUARD_HOSTS` lists the ssh hosts that get the block list. |
 | `cclimits-guard` | The Claude Code hook (UserPromptSubmit + PreToolUse) that refuses prompts and tool calls for a blocked account. |

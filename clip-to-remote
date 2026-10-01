@@ -1,20 +1,40 @@
 #!/usr/bin/osascript -l JavaScript
-// clip-to-remote: copy every image put on this Mac's clipboard to the remote
-// Mac's clipboard (ssh alias ccc-remote, or $CCC_HOST), so pasting it in
+// clip-to-remote: copy every image and text put on this Mac's clipboard to the
+// remote Mac's clipboard (ssh alias ccc-remote, or $CCC_HOST), so pasting it in
 // Claude Code running there (over ccc) works. Universal Clipboard does not
-// deliver reliably while the remote Mac's screen sleeps or is locked.
+// deliver reliably while the remote Mac's screen sleeps or is locked, nor off
+// the local network at all.
 // Runs under the local.clip-to-remote LaunchAgent; the remote ~/.local/bin/clip-set-png
-// receives the PNG on stdin. Text is left alone: the terminal pastes it.
+// receives a PNG on stdin, the remote pbcopy receives text. Text a password
+// manager marks concealed or transient never leaves this Mac.
 ObjC.import('AppKit');
 
 const app = Application.currentApplication();
 app.includeStandardAdditions = true;
 const pasteboard = $.NSPasteboard.generalPasteboard;
 const png = $.NSTemporaryDirectory().js + 'clip-to-remote.png';
+const txt = $.NSTemporaryDirectory().js + 'clip-to-remote.txt';
 const host = $.NSProcessInfo.processInfo.environment.objectForKey('CCC_HOST').js || 'ccc-remote';
 let last = pasteboard.changeCount;
-// Universal Clipboard can echo the remote copy back here; never resend the same image
+// Universal Clipboard can echo the remote copy back here; never resend the same content
 let sent = null;
+let sentText = null;
+
+// nspasteboard.org markers: password managers flag secrets so clipboard tools skip them
+function isSecret() {
+  const types = ObjC.deepUnwrap(pasteboard.types) || [];
+  return types.includes('org.nspasteboard.ConcealedType') ||
+    types.includes('org.nspasteboard.TransientType');
+}
+
+function send(command, file, what) {
+  try {
+    app.doShellScript(
+      "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 " + host + " '" + command + "' < '" + file + "'");
+  } catch (e) {
+    console.log('clip-to-remote: ' + host + ' unreachable, ' + what + ' not sent: ' + e);
+  }
+}
 
 // PNG bytes of the clipboard image, converting TIFF (screenshots, many apps)
 function clipboardPng() {
@@ -31,14 +51,18 @@ while (true) {
   const count = pasteboard.changeCount;
   if (count === last) continue;
   last = count;
+  if (isSecret()) continue;
   const data = clipboardPng();
-  if (!data || (sent && data.isEqualToData(sent))) continue;
-  sent = data;
-  data.writeToFileAtomically(png, true);
-  try {
-    app.doShellScript(
-      "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 " + host + " .local/bin/clip-set-png < '" + png + "'");
-  } catch (e) {
-    console.log('clip-to-remote: ' + host + ' unreachable, image not sent: ' + e);
+  if (data) {
+    if (sent && data.isEqualToData(sent)) continue;
+    sent = data;
+    data.writeToFileAtomically(png, true);
+    send('.local/bin/clip-set-png', png, 'image');
+    continue;
   }
+  const text = pasteboard.stringForType($.NSPasteboardTypeString);
+  if (text.isNil() || text.length === 0 || (sentText && text.isEqualToString(sentText))) continue;
+  sentText = text;
+  text.writeToFileAtomicallyEncodingError(txt, true, $.NSUTF8StringEncoding, $());
+  send('LC_CTYPE=UTF-8 pbcopy', txt, 'text');
 }
