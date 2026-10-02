@@ -51,6 +51,16 @@ pane_tag() {
     | grep -v '^missing value$' | tr -d '\n' | base64
 }
 
+# On the way out, name the conversation this pane showed (its tag, which the
+# remote keeps current) and how to pick it up on another account
+print_last_conversation() {
+  local fields
+  fields=("${(@ps:\t:)$(pane_tag | base64 -d 2>/dev/null)}")
+  [[ -n "${fields[1]}" ]] || return 0
+  print -P "%F{244}Claude conversation:%f ${fields[2]:-untitled} %F{244}(${fields[1]}) on ${fields[3]:-?}, session ${fields[4]:-?}%f"
+  print -P "%F{244}On another account:%f ccc ${fields[1][1,8]} <account>"
+}
+
 # LC_CCC_ACCOUNT stays empty unless named, so the remote can tell a chosen
 # account from the default (work)
 export LC_CCC_ACCOUNT= LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
@@ -125,7 +135,8 @@ while true; do
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
   reset_terminal
-  (( rc == 0 || rc == 130 )) && { reset_colours; exit $rc }
+  (( rc == 0 )) && { reset_colours; print_last_conversation; exit 0 }
+  (( rc == 130 )) && { reset_colours; exit 130 }
   # The pane's tag names the conversation, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
   print -P "%F{yellow}Connection to $host lost; reconnecting in 5 s (Ctrl-C to stop)...%f"

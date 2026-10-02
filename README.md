@@ -25,7 +25,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 
 | Command | What it does |
 |---|---|
-| `ccc` | Reconnect this iTerm pane to the Claude conversation it showed (found by id, then name; resumed with `claude --resume` if no Claude runs it any more), otherwise show the session menu: account, bilan, state, whether a pane here shows it, title. Reconnects on its own when the connection drops. |
+| `ccc` | Reconnect this iTerm pane to the Claude conversation it showed (found by id, then name; resumed with `claude --resume` if no Claude runs it any more), otherwise show the session menu: account, bilan, state, whether a pane here shows it, title. Reconnects on its own when the connection drops. On exit it prints the conversation the pane showed, with the command to resume it on another account. |
 | `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. The menu's prompt also takes a saved conversation's id (or 6+ character prefix) to resume it. Add an account name to bind a new or resumed session to it: `oss` is `~/.claude-perso`, any other name `x` is `~/.claude-x`. |
 | `ccc switch <account>` | Resume this pane's conversation on another account, in a fresh session (exit Claude first). |
 | `ccc [resume] <id> [<account>]` | Reattach, or resume, a saved conversation by id or id prefix (6+ characters), e.g. one no pane shows any more. With an account, it resumes there; if a Claude on another account still runs it, exit that one first. |
