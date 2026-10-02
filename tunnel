@@ -18,7 +18,7 @@ fi
 forwards=()
 for p in $ports; do
   [[ "$p" == <1-65535> ]] || { echo "Not a port: $p"; exit 1; }
-  forwards+=(-L "$p:localhost:$p")
+  forwards+=(-L "${p}:localhost:${p}")
 done
 echo "Tunnel to $host open on port(s): ${(j:, :)ports}. Ctrl-C to close."
 trap 'echo "\nTunnel closed."' INT
