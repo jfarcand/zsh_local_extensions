@@ -2,12 +2,14 @@
 # tunnel: forward localhost ports from this Mac to the remote Mac (ssh alias
 # ccc-remote, or $CCC_HOST) and hold until Ctrl-C.
 # `tunnel 57857 8090` forwards those ports; bare `tunnel` finds the callback
-# port of every pending Claude Code /login on the remote Mac (a `2.1.*` process
-# listening on 127.0.0.1) so the browser redirect on this Mac reaches it.
+# port of every pending Claude Code /login on the remote Mac (a Claude process,
+# named `claude` or after its version `2.1.*`, listening on a loopback port; it
+# listens on nothing else) so the browser redirect on this Mac reaches it. The
+# forward targets `localhost`, which reaches an IPv4 or an IPv6 listener.
 host=${CCC_HOST:-ccc-remote}
 ports=("$@")
 if (( ${#ports} == 0 )); then
-  ports=(${(f)"$(ssh -o BatchMode=yes $host "lsof -nP -a -iTCP@127.0.0.1 -sTCP:LISTEN -c 2.1. -Fn 2>/dev/null | sed -n 's/^n127.0.0.1://p' | sort -u")"})
+  ports=(${(f)"$(ssh -o BatchMode=yes $host "lsof -nP -a -iTCP -sTCP:LISTEN -c claude -c 2.1. -Fn 2>/dev/null | sed -nE 's/^n(127\\.0\\.0\\.1|\\[::1\\]|localhost):([0-9]+)\$/\\2/p' | sort -u")"})
   if (( ${#ports} == 0 )); then
     echo "No pending Claude login on $host. Pass the port from the browser URL: tunnel <port>"
     exit 1
@@ -16,7 +18,7 @@ fi
 forwards=()
 for p in $ports; do
   [[ "$p" == <1-65535> ]] || { echo "Not a port: $p"; exit 1; }
-  forwards+=(-L "$p:127.0.0.1:$p")
+  forwards+=(-L "$p:localhost:$p")
 done
 echo "Tunnel to $host open on port(s): ${(j:, :)ports}. Ctrl-C to close."
 trap 'echo "\nTunnel closed."' INT
