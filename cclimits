@@ -684,6 +684,33 @@ extra_amount_from_json() {
     | (.used_credits // 0) / pow(10; .decimal_places // 2)' 2>/dev/null || true
 }
 
+# Hold rules, read fresh on every pass from ~/.config/cclimits/holds, one per
+# line: "<account> <limit key> <percent> <YYYY-MM-DD HH:MM>" (# comments). The
+# guard blocks the account once that limit (session, weekly_all,
+# weekly_scoped:<model>) reaches the percent, until that local time: e.g. keep
+# an account short of its weekly 100% until another one resets. A rule whose
+# time has passed does nothing. Prints "<until epoch>\t<reason>" for account $1
+# and row file $2, or nothing.
+hold_for() {
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/cclimits/holds" acct key pct day hm at now best=0 why=""
+  local order rkey label rpct epoch
+  [[ -f "$f" ]] || return 0
+  now=$(date +%s)
+  while read -r acct key pct day hm _; do
+    [[ "$acct" == "$1" && "$pct" =~ ^[0-9]+$ ]] || continue
+    at=$(date -j -f '%Y-%m-%d %H:%M:%S' "$day $hm:00" +%s 2>/dev/null) || continue
+    (( at > now )) || continue
+    while IFS=$'\t' read -r order rkey label rpct epoch; do
+      [[ "$rkey" == "$key" && "$rpct" =~ ^[0-9]+$ ]] || continue
+      if (( rpct >= pct && at > best )); then
+        best=$at why="$label at ${rpct}% (hold from ${pct}% until $(date -r "$at" '+%a %H:%M'))"
+      fi
+    done < "$2"
+  done < <(sed 's/#.*//' "$f")
+  (( best > 0 )) && printf '%s\t%s\n' "$best" "$why"
+  return 0
+}
+
 # The daily extra-usage allowance, read fresh on every pass; empty when none is
 # set (or the file holds no number), which blocks at the limit itself.
 daily_cap() {
@@ -1075,7 +1102,7 @@ show_status() {
 # no numbers this cycle keeps its previous state; the hook itself lets a block
 # lapse at its reset time, so a stale block cannot outlive the window.
 guard_update() {
-  local i order key label pct epoch extra until reason f was amount spent midnight cap
+  local i order key label pct epoch extra until reason f was amount spent midnight cap hold_until hold_why
   mkdir -p "$GUARD_DIR"
   for (( i = 0; i < ACC_COUNT; i++ )); do
     [[ -n "${ACC_SRC[$i]}" ]] || continue
@@ -1108,6 +1135,11 @@ guard_update() {
         reason="$reason; today's extra usage ${spent:-unknown} reached the daily cap of ${cap}"
       fi
     fi
+    # a hold rule outlasting the extra-usage block wins
+    IFS=$'\t' read -r hold_until hold_why < <(hold_for "${ACC_NAME[$i]}" "${ACC_SRC[$i]}") || true
+    if [[ "${hold_until:-}" =~ ^[0-9]+$ ]] && (( hold_until > until )); then
+      until=$hold_until reason=$hold_why
+    fi
     was=false; [[ -f "$f" ]] && was=true
     if (( until > 0 )); then
       printf '%s\t%s\n' "$until" "$reason" > "$f"
@@ -1116,7 +1148,7 @@ guard_update() {
       fi
     elif $was; then
       rm -f "$f"
-      guard_notify "${ACC_NAME[$i]} unblocked" "under its plan limits, or under today's extra-usage cap"
+      guard_notify "${ACC_NAME[$i]} unblocked" "under its plan limits and hold rules, or under today's extra-usage cap"
     fi
   done
   local host
