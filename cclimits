@@ -523,6 +523,36 @@ backoff_delay() {
 
 # This account's token expiry (epoch seconds, 0 if unreadable). Doubles as the
 # token's identity: Claude Code writes a new expiresAt every time it refreshes.
+# True while account $1 has a block in force at time $2.
+guard_blocked() {
+  local until reason
+  [[ -f "$GUARD_DIR/$1" ]] || return 1
+  IFS=$'\t' read -r until reason < "$GUARD_DIR/$1" || true
+  [[ "$until" =~ ^[0-9]+$ ]] && (( until > $2 ))
+}
+
+# Refresh the OAuth token of the account in config dir $1 (named $2): Claude
+# Code renews a token only when it makes a request, so make the smallest one
+# (Haiku, one word, nothing saved). The default ~/.claude runs without
+# CLAUDE_CONFIG_DIR, since the Keychain item name derives from that setting.
+# Bounded: a hung request is killed after 60 s.
+refresh_token() {
+  local claude pid n=0
+  claude=$(command -v claude || echo "$HOME/.local/bin/claude")
+  [[ -x "$claude" ]] || return 0
+  (
+    cd "${TMPDIR:-/tmp}" || exit 0
+    if [[ "$1" == "$HOME/.claude" ]]; then unset CLAUDE_CONFIG_DIR; else export CLAUDE_CONFIG_DIR="$1"; fi
+    exec "$claude" -p --model haiku --no-session-persistence "Reply with: ok"
+  ) >/dev/null 2>&1 </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && (( n < 60 )); do sleep 1; n=$((n + 1)); done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  echo "cclimits: refreshed the expired token of $2" >&2
+  return 0
+}
+
 token_expires_at() {
   local exp
   exp=$(security find-generic-password -s "$1" -w 2>/dev/null \
@@ -798,6 +828,14 @@ collect_all() {
     base=$(cache_base "${ACC_NAME[$i]}")
     ACC_EXTRA[$i]="$base.extra"
     tok_exp=$(token_expires_at "${ACC_SVC[$i]}")
+    # A guard pass revives an expired token itself: an account used only on
+    # another Mac never refreshes its token here, and the endpoint answers an
+    # expired token with 429, so the guard would go blind on it. Never while
+    # the account is blocked: at its limit even one request may bill.
+    if $GUARD && (( tok_exp > 0 && tok_exp <= now )) && ! guard_blocked "${ACC_NAME[$i]}" "$now"; then
+      refresh_token "${ACC_DIR[$i]}" "${ACC_NAME[$i]}"
+      tok_exp=$(token_expires_at "${ACC_SVC[$i]}")
+    fi
     cooldown=0; cd_token=""
     # guard the redirect: bash reports a failed "< missing-file" itself, before
     # any 2>/dev/null on the same command can swallow it
