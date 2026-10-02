@@ -29,6 +29,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. The menu's prompt also takes a saved conversation's id (or 6+ character prefix) to resume it. Add an account name to bind a new or resumed session to it: `oss` is `~/.claude-perso`, any other name `x` is `~/.claude-x`. |
 | `ccc switch <account>` | Resume this pane's conversation on another account, in a fresh session (exit Claude first). |
 | `ccc [resume] <id> [<account>]` | Reattach, or resume, a saved conversation by id or id prefix (6+ characters), e.g. one no pane shows any more. With an account, it resumes there; if a Claude on another account still runs it, exit that one first. |
+| `ccc ssh` | A plain shell on the remote Mac: no tmux, no Claude, no reconnect. |
 | `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
 | `tunnel [port…]` | Forward localhost ports to the remote Mac until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
 | `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |
