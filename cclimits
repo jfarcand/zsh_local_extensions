@@ -1140,7 +1140,7 @@ show_status() {
 # no numbers this cycle keeps its previous state; the hook itself lets a block
 # lapse at its reset time, so a stale block cannot outlive the window.
 guard_update() {
-  local i order key label pct epoch extra until reason f was amount spent midnight cap hold_until hold_why
+  local i order key label pct epoch extra until reason f was amount spent midnight cap hold_line hold_until hold_why
   mkdir -p "$GUARD_DIR"
   for (( i = 0; i < ACC_COUNT; i++ )); do
     [[ -n "${ACC_SRC[$i]}" ]] || continue
@@ -1174,7 +1174,11 @@ guard_update() {
       fi
     fi
     # a hold rule outlasting the extra-usage block wins
-    IFS=$'\t' read -r hold_until hold_why < <(hold_for "${ACC_NAME[$i]}" "${ACC_SRC[$i]}") || true
+    # split by expansion, not `IFS=<tab> read < <(hold_for …)`: bash 3.2 (the
+    # LaunchAgent's /bin/bash) applies that IFS inside hold_for too, where it
+    # reads every rule as one word and matches none
+    hold_line=$(hold_for "${ACC_NAME[$i]}" "${ACC_SRC[$i]}")
+    hold_until=${hold_line%%$'\t'*} hold_why=${hold_line#*$'\t'}
     if [[ "${hold_until:-}" =~ ^[0-9]+$ ]] && (( hold_until > until )); then
       until=$hold_until reason=$hold_why
     fi
