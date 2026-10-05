@@ -6,8 +6,15 @@
 # named `claude` or after its version `2.1.*`, listening on a loopback port; it
 # listens on nothing else) so the browser redirect on this Mac reaches it. The
 # forward targets `localhost`, which reaches an IPv4 or an IPv6 listener.
+# `@<ssh alias>` anywhere in the arguments picks another remote Mac, as in ccc
 host=${CCC_HOST:-ccc-remote}
-ports=("$@")
+ports=()
+for a in "$@"; do
+  case "$a" in
+    @?*) host=${a#@} ;;
+    *) ports+=("$a") ;;
+  esac
+done
 if (( ${#ports} == 0 )); then
   ports=(${(f)"$(ssh -o BatchMode=yes $host "lsof -nP -a -iTCP -sTCP:LISTEN -c claude -c 2.1. -Fn 2>/dev/null | sed -nE 's/^n(127\\.0\\.0\\.1|\\[::1\\]|localhost):([0-9]+)\$/\\2/p' | sort -u")"})
   if (( ${#ports} == 0 )); then
