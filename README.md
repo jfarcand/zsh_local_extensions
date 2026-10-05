@@ -29,6 +29,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `ccc list` / `ccc new` / `ccc <n>` | The menu / a fresh session / attach session `n`. The menu's prompt also takes a saved conversation's id (or 6+ character prefix) to resume it. Add an account name to bind a new or resumed session to it: `oss` is `~/.claude-perso`, any other name `x` is `~/.claude-x`. |
 | `ccc switch <account>` | Resume this pane's conversation on another account, in a fresh session (exit Claude first). |
 | `ccc [resume] <id> [<account>]` | Reattach, or resume, a saved conversation by id or id prefix (6+ characters), e.g. one no pane shows any more. With an account, it resumes there; if a Claude on another account still runs it, exit that one first. |
+| `ccc @<alias> …` | Any `ccc` command on another remote Mac (an ssh alias set up like `ccc-remote`), e.g. `ccc @douche new`. `ccc-remote` stays the default; a bare `ccc` in a pane that last showed another Mac says how to go back there. Each Mac's password is its own keychain item: `ccc-remote-login` for `ccc-remote`, `ccc-<host>-login` for the others. |
 | `ccc ssh` | A plain shell on the remote Mac: no tmux, no Claude, no reconnect. |
 | `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
 | `tunnel [port…]` | Forward localhost ports to the remote Mac until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
@@ -52,8 +53,11 @@ Pieces that live outside this repo:
 - **Both Macs** `~/.claude/settings.json`: the `ccc-tag`, `cclimits-guard` and `rtk-claude-hook` hooks; `~/.config/rtk/claude-accounts`; an rtk account's own `CLAUDE.md` importing the shared one plus `@RTK.md`.
 - **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
   `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`.
-- **This Mac** keychain item `ccc-remote-login` (or `$CCC_KEYCHAIN_ITEM`), which
-  `ccc` uses to unlock the remote login keychain.
+- **This Mac** keychain item `ccc-remote-login`, and `ccc-<host>-login` per other
+  remote Mac (or `$CCC_KEYCHAIN_ITEM`), which `ccc` uses to unlock the remote login keychain.
+- **Another remote Mac** gets the same remote pieces, its own `<alias>-fwd` ssh host and
+  `local.ccc-forward-<alias>` LaunchAgent for the URL-back channel, and a place in
+  `CCLIMITS_GUARD_HOSTS`.
 
 ## GitHub
 

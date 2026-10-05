@@ -17,6 +17,7 @@
 #   ccc <n>        attach tmux session n directly
 #   ccc ssh        a plain shell on the remote Mac: no tmux, no Claude, no
 #                  keychain unlock, no reconnect
+#   ccc @<alias> …  any of the above on another remote Mac
 #   ccc recover    open an iTerm tab for every Claude session on the remote
 #                  Mac that no live pane here is showing (after drops, sleep,
 #                  a restart)
@@ -32,7 +33,14 @@
 # shows (iTerm variable user.cccClaude, set by ~/.local/bin/ccc-tag there, kept
 # by iTerm after the connection dies); ccc sends that tag (LC_CCC_CLAUDE) to
 # reconnect by it. When the connection drops, ccc reconnects until Ctrl-C.
-host=${CCC_HOST:-ccc-remote}
+# Several remote Macs: ccc-remote is the default; `@<ssh alias>` anywhere in
+# the arguments picks another (`ccc @douche new`), as does $CCC_HOST. The tag
+# carries the Mac it came from (its LocalHostName in lower case); a bare `ccc`
+# in a pane that last showed another Mac says so, and that Mac's own ccc-tmux
+# is the only one that acts on the tag. Each Mac's password is its own keychain item: ccc-remote-login
+# for ccc-remote, ccc-<host>-login for the others (<host> is the first label
+# of the ssh HostName), unless $CCC_KEYCHAIN_ITEM names one.
+host=${CCC_HOST:-}
 
 # Source ports of this Mac's established SSH connections
 live_ports() {
@@ -84,10 +92,11 @@ for arg in "$@"; do
   work) LC_CCC_ACCOUNT=work account_given=true ;;
   list|new|switch) LC_CCC_MODE=$arg ;;
   ssh) plain=true ;;
+  @?*) host=${arg#@} ;;
   <->) LC_CCC_ATTACH=$arg ;;
   recover)
     LC_CCC_PORTS=$(live_ports) LC_CCC_MODE=tsv ssh -o BatchMode=yes \
-      -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE $host .local/bin/ccc-tmux \
+      -o SendEnv=LC_CCC_PORTS -o SendEnv=LC_CCC_MODE ${host:-ccc-remote} .local/bin/ccc-tmux \
       | while IFS=$'\t' read -r n acct state here bilan title; do
           [[ "$state" == shell || "$here" == yes ]] && continue
           echo "Reopening session $n ($acct, bilan $bilan, $state): $title"
@@ -117,6 +126,25 @@ reset_colours() { printf '\033]6;1;bg;*;default\a\033]111\a' }
 reset_terminal() {
   printf '\033[>4;0m\033[<u\033[?1004l\033[?2004l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h'
 }
+if [[ -z "$host" ]]; then
+  host=ccc-remote
+  # this pane last showed another Mac: its tag means nothing on this one
+  tag_host=$(pane_tag | base64 -d 2>/dev/null | awk -F'\t' '{ print $5 }')
+  if [[ -n "$tag_host" && "$(ssh -G "$tag_host" 2>/dev/null | awk '$1 == "hostname" { print $2 }')" != "$(ssh -G "$host" 2>/dev/null | awk '$1 == "hostname" { print $2 }')" ]]; then
+    print -P "%F{yellow}This pane last showed $tag_host; to go back there: ccc @$tag_host%f"
+  fi
+fi
+if [[ -n "${CCC_KEYCHAIN_ITEM:-}" ]]; then
+  keychain_item=$CCC_KEYCHAIN_ITEM
+else
+  host_name=$(ssh -G "$host" 2>/dev/null | awk '$1 == "hostname" { print $2 }')
+  if [[ "$host_name" == "$(ssh -G ccc-remote 2>/dev/null | awk '$1 == "hostname" { print $2 }')" ]]; then
+    keychain_item=ccc-remote-login
+  else
+    keychain_item="ccc-${host_name%%.*}-login"
+  fi
+fi
+
 if $plain; then
   ssh -t $host
   rc=$?
@@ -138,7 +166,7 @@ exec $HOME/.local/bin/ccc-tmux
 '
 while true; do
   # read on every attempt, so an item added after this pane started is used
-  LC_CCC_KC=$(security find-generic-password -a "$USER" -s "${CCC_KEYCHAIN_ITEM:-ccc-remote-login}" -w 2>/dev/null)
+  LC_CCC_KC=$(security find-generic-password -a "$USER" -s "$keychain_item" -w 2>/dev/null)
   LC_CCC_PORTS=$(live_ports) LC_CCC_CLAUDE=$(pane_tag)
   export LC_CCC_KC LC_CCC_PORTS LC_CCC_CLAUDE
   ssh -t -o ConnectTimeout=10 -o SendEnv=LC_CCC_KC -o SendEnv=LC_CCC_ACCOUNT -o SendEnv=LC_CCC_ATTACH \
