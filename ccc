@@ -164,6 +164,14 @@ fi
 unset LC_CCC_KC
 exec $HOME/.local/bin/ccc-tmux
 '
+# Every connection's end and ccc's own exit go to a log, so a pane that drops
+# back to the shell instead of reconnecting leaves a record of why
+log=$HOME/Library/Logs/ccc.log
+ccc_log() { print -r -- "$(date '+%F %T') ${TTY#/dev/} pid=$$ host=$host $*" >> $log 2>/dev/null }
+trap 'ccc_log "exit status=$?"' EXIT
+for sig in HUP TERM PIPE; do trap "ccc_log 'signal $sig'; exit 1" $sig; done
+ccc_log "start: ${(j: :)@}"
+
 while true; do
   # read on every attempt, so an item added after this pane started is used
   LC_CCC_KC=$(security find-generic-password -a "$USER" -s "$keychain_item" -w 2>/dev/null)
@@ -174,6 +182,7 @@ while true; do
   # 0 is a detach or an ended session, 130 a Ctrl-C at the menu; anything
   # else (255 connection lost, a killed ssh) reconnects
   rc=$?
+  ccc_log "ssh ended rc=$rc"
   reset_terminal
   (( rc == 0 )) && { reset_colours; print_last_conversation; exit 0 }
   (( rc == 130 )) && { reset_colours; exit 130 }
