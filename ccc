@@ -18,7 +18,7 @@
 #   ccc ssh        a plain shell on the remote Mac: no tmux, no Claude, no
 #                  keychain unlock, no reconnect
 #   ccc @<alias> …  any of the above on another remote Mac
-#   ccc recover    open an iTerm tab for every Claude session on the remote
+#   ccc recover    open an iTerm window for every Claude session on the remote
 #                  Mac that no live pane here is showing (after drops, sleep,
 #                  a restart)
 # Unlocks the remote login keychain first: every SSH session starts with it
@@ -100,9 +100,11 @@ for arg in "$@"; do
       | while IFS=$'\t' read -r n acct state here bilan title; do
           [[ "$state" == shell || "$here" == yes ]] && continue
           echo "Reopening session $n ($acct, bilan $bilan, $state): $title"
-          osascript -e 'tell application "iTerm2" to tell current window' \
-            -e 'set t to (create tab with default profile)' \
-            -e "tell current session of t to write text \"ccc $n\"" \
+          # its own window, as each session had before; a Mac other than the
+          # default is named so the new pane connects back to it
+          osascript -e 'tell application "iTerm2"' \
+            -e 'set w to (create window with default profile)' \
+            -e "tell current session of w to write text \"ccc ${host:+@$host }$n\"" \
             -e 'end tell' </dev/null >/dev/null
         done
     exit 0 ;;

@@ -31,7 +31,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `ccc [resume] <id> [<account>]` | Reattach, or resume, a saved conversation by id or id prefix (6+ characters), e.g. one no pane shows any more. With an account, it resumes there; if a Claude on another account still runs it, exit that one first. |
 | `ccc @<alias> …` | Any `ccc` command on another remote Mac (an ssh alias set up like `ccc-remote`), e.g. `ccc @douche new`. `ccc-remote` stays the default; a bare `ccc` in a pane that last showed another Mac says how to go back there. Each Mac's password is its own keychain item: `ccc-remote-login` for `ccc-remote`, `ccc-<host>-login` for the others. |
 | `ccc ssh` | A plain shell on the remote Mac: no tmux, no Claude, no reconnect. |
-| `ccc recover` | Open an iTerm tab for every remote Claude session that no pane here shows. |
+| `ccc recover` | Open an iTerm window for every remote Claude session that no pane here shows. |
 | `tunnel [@<alias>] [port…]` | Forward localhost ports to the remote Mac (or `@<alias>`) until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
 | `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |
 | `clip-to-remote` | Runs under the `local.clip-to-remote` LaunchAgent: copies every image and text put on this Mac's clipboard to the remote Mac's, so pasting in Claude there works; text a password manager marks concealed stays here. |
