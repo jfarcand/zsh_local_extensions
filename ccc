@@ -15,6 +15,9 @@
 #   ccc [resume] <id> [<account>]  reattach, or resume, a saved conversation by
 #                  id or id prefix (e.g. one no pane shows any more)
 #   ccc <n>        attach tmux session n directly
+#   ccc clean      list the finished remote sessions (a Claude idle at bilan
+#                  10 for 2 h+, a shell unused for a day) and close them on a
+#                  yes; conversations stay resumable by id
 #   ccc ssh        a plain shell on the remote Mac: no tmux, no Claude, no
 #                  keychain unlock, no reconnect
 #   ccc @<alias> …  any of the above on another remote Mac
@@ -90,7 +93,7 @@ for arg in "$@"; do
   fi
   case "$arg" in
   work) LC_CCC_ACCOUNT=work account_given=true ;;
-  list|new|switch) LC_CCC_MODE=$arg ;;
+  list|new|switch|clean) LC_CCC_MODE=$arg ;;
   ssh) plain=true ;;
   @?*) host=${arg#@} ;;
   <->) LC_CCC_ATTACH=$arg ;;
@@ -186,7 +189,7 @@ while true; do
   rc=$?
   ccc_log "ssh ended rc=$rc"
   reset_terminal
-  (( rc == 0 )) && { reset_colours; print_last_conversation; exit 0 }
+  (( rc == 0 )) && { reset_colours; [[ "$LC_CCC_MODE" == clean ]] || print_last_conversation; exit 0 }
   (( rc == 130 )) && { reset_colours; exit 130 }
   # The pane's tag names the conversation, so reconnecting lands back in it
   LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
