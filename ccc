@@ -20,6 +20,10 @@
 #                  yes; conversations stay resumable by id
 #   ccc ssh        a plain shell on the remote Mac: no tmux, no Claude, no
 #                  keychain unlock, no reconnect
+#   ccc [ssh] <command…>  run a command there instead (`ccc mole status`), in
+#                  a login shell as `ccc ssh` gives, and exit with its status;
+#                  `ssh` is needed only when the command's first word is one
+#                  of ccc's own words or an account name
 #   ccc @<alias> …  any of the above on another remote Mac
 #   ccc recover    open an iTerm window for every Claude session on the remote
 #                  Mac that no live pane here is showing (after drops, sleep,
@@ -79,12 +83,31 @@ print_last_conversation() {
 export LC_CCC_ACCOUNT= LC_CCC_ATTACH= LC_CCC_MODE= LC_CCC_RESUME=
 account_given=false
 plain=false
+first=true
+cmd=()
+# An account is a word naming one: work, oss, or the x of a ~/.claude-x config
+# dir on this Mac (cclimits reads every account from here, so each has one)
+is_account() { [[ "$1" == work || "$1" == oss || -d "$HOME/.claude-$1" ]] }
 if [[ "$1" == resume ]]; then
   [[ -n "$2" ]] || { echo "usage: ccc resume <conversation id or prefix> [<account>]"; exit 1; }
-  LC_CCC_MODE=resume LC_CCC_RESUME=$2
+  LC_CCC_MODE=resume LC_CCC_RESUME=$2 first=false
   shift 2
 fi
 for arg in "$@"; do
+  # after `ssh`, or a first word ccc has no meaning for, the rest is the
+  # command; an @alias before its first word still picks the Mac
+  if $plain; then
+    if (( ! $#cmd )) && [[ "$arg" == @?* ]]; then host=${arg#@}; else cmd+=("$arg"); fi
+    continue
+  fi
+  if $first && [[ "$arg" != @?* ]]; then
+    first=false
+    if ! [[ "$arg" =~ '^[0-9a-f-]{6,}$' && "$arg" == *[0-9]* && "$arg" == *[a-f-]* ]] &&
+       ! [[ "$arg" == (list|new|switch|clean|ssh|recover|<->) ]] && ! is_account "$arg"; then
+      plain=true cmd=("$arg")
+      continue
+    fi
+  fi
   # a conversation id or its prefix (6+ hex characters, not a session number)
   # is `resume <id>`; checked first, since it also fits the account pattern
   if [[ "$arg" =~ '^[0-9a-f-]{6,}$' && "$arg" == *[0-9]* && "$arg" == *[a-f-]* ]]; then
@@ -112,7 +135,7 @@ for arg in "$@"; do
         done
     exit 0 ;;
   [a-z]*([a-z0-9-])) LC_CCC_ACCOUNT=$arg account_given=true ;;
-  *) echo "usage: ccc [list | new | switch | <session> | recover] [<account>]"; exit 1 ;;
+  *) echo "usage: ccc [list | new | switch | <session> | recover] [<account>] | [ssh] [<command>…]"; exit 1 ;;
 esac; done
 if [[ "$LC_CCC_MODE" == switch ]] && ! $account_given; then
   echo "usage: ccc switch <account>   (work, oss, or the x of ~/.claude-x)"
@@ -151,10 +174,23 @@ else
 fi
 
 if $plain; then
-  ssh -t $host
+  if (( $#cmd )); then
+    # joined with spaces and parsed by the remote shell, as ssh does, so
+    # `ccc 'ls ~ | wc -l'` expands and pipes there. On a terminal it runs in an
+    # interactive login shell, as `ccc ssh` gives (PATH, aliases, functions);
+    # into a pipe or a file, a login shell alone, whose output carries none of
+    # the escapes the remote .zshrc prints for iTerm
+    if [[ -t 0 && -t 1 ]]; then
+      ssh -q -t $host "exec \$SHELL -lic ${(q)${(j: :)cmd}}"
+    else
+      ssh -q -T $host "exec \$SHELL -lc ${(q)${(j: :)cmd}}"
+    fi
+  else
+    ssh -t $host
+  fi
   rc=$?
-  reset_terminal
-  reset_colours
+  # into a pipe, these escapes would land in the output
+  if [[ -t 1 ]]; then reset_terminal; reset_colours; fi
   exit $rc
 fi
 
