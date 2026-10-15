@@ -6,6 +6,9 @@
 # claude-team), matching cclimits' account names. A block lapses on its own
 # at the limit's reset time. Exit 2 refuses the prompt or the tool call and
 # shows the reason; to override, delete the block file it names.
+# A session started with ANTHROPIC_API_KEY bills that key's Console
+# organization, not the plan's extra usage, so a block never applies to it.
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && exit 0
 name=$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
 name=${name#.}
 f="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits/guard/$name"
