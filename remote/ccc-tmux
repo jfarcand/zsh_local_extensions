@@ -1,0 +1,425 @@
+#!/bin/zsh
+# Entry point for `ccc` from the local Mac: list every tmux session with its
+# Claude account, bilan score, state, whether a live pane there shows it, and its
+# title, most recently active first; then attach the one picked
+# (taking it over from any stale client a dropped connection left behind), or
+# start a fresh one.
+#   LC_CCC_ACCOUNT=a     a fresh session is bound to Claude account a: work
+#                        (~/.claude), oss (~/.claude-perso) or any other name
+#                        (~/.claude-<a>), through CLAUDE_CONFIG_DIR
+#   LC_CCC_PORTS=p1,p2   the local Mac's source ports of its live SSH connections;
+#                        a client whose connection is not among them is stale
+#   LC_CCC_ATTACH=N      attach session N without the menu
+#   LC_CCC_MODE=tsv      print the sessions as tab-separated rows and exit
+#   LC_CCC_MODE=list     the menu, even when the pane carries a tag
+#   LC_CCC_MODE=clean    list the finished sessions and close them on a yes
+#   LC_CCC_MODE=new      a fresh session, no menu
+#   LC_CCC_MODE=switch   resume the pane's conversation (LC_CCC_CLAUDE) on the
+#                        account LC_CCC_ACCOUNT, in a fresh session
+#   LC_CCC_MODE=resume   reattach or resume conversation LC_CCC_RESUME (an id
+#                        or its prefix) on LC_CCC_ACCOUNT
+#   LC_CCC_CLAUDE=b64    the asking pane's tag (see ~/.local/bin/ccc-tag):
+#                        "<conversation id>\t<name>\t<account>\t<tmux session>";
+#                        that conversation is reattached, found by id, then by
+#                        name; a pane that never ran Claude gets its tmux
+#                        session back; a conversation no Claude runs any more is
+#                        resumed in a fresh session; anything else is the menu
+tmux=/opt/homebrew/bin/tmux
+zmodload zsh/datetime
+# a named account (ccc sends none by default) decides where a resume runs
+account_named=${LC_CCC_ACCOUNT:+yes}
+account=${LC_CCC_ACCOUNT:-work}
+live_ports=",${LC_CCC_PORTS},"
+attach=$LC_CCC_ATTACH
+mode=$LC_CCC_MODE
+resume_id=$LC_CCC_RESUME
+tag=$LC_CCC_CLAUDE
+unset LC_CCC_ACCOUNT LC_CCC_PORTS LC_CCC_ATTACH LC_CCC_MODE LC_CCC_CLAUDE LC_CCC_RESUME
+
+# 16 dark backgrounds with a brighter tab colour each ("tab r g b|bg hex"),
+# hues interleaved so neighbouring picks differ strongly
+palette=("215 66 66|330f0f" "66 215 159|0f3326" "215 66 178|330f2a" "84 215 66|13330f"
+         "140 66 215|210f33" "196 215 66|2f330f" "66 103 215|0f1833" "215 122 66|331d0f"
+         "66 215 215|0f3333" "215 66 122|330f1d" "66 215 103|0f3318" "196 66 215|2f0f33"
+         "140 215 66|21330f" "84 66 215|130f33" "215 178 66|332a0f" "66 159 215|0f2633")
+
+# The session's palette index, kept as the tmux option @ccc_color; a session
+# without one gets the colour fewest other sessions use
+session_color() {
+  # "=N:" and not "=N": session options reject the bare "=N" target, and -q
+  # would hide that
+  local c=$($tmux show-options -qv -t "=$1:" @ccc_color) i best used
+  if [[ -z "$c" ]]; then
+    used=$($tmux list-sessions -F '#{@ccc_color}')
+    best=999
+    for i in {1..${#palette}}; do
+      n=$(print -r -- "$used" | grep -cx "$i")
+      (( n < best )) && { best=$n; c=$i; }
+    done
+    $tmux set-option -t "=$1:" @ccc_color $c
+  fi
+  print -r -- $c
+}
+
+# Paint the iTerm pane (tab + background) in the session's colour
+paint_pane() {
+  local pick=$palette[$(session_color $1)]
+  local rgb=(${=pick%%|*})
+  printf '\033]6;1;bg;red;brightness;%s\a\033]6;1;bg;green;brightness;%s\a\033]6;1;bg;blue;brightness;%s\a' $rgb
+  printf '\033]1337;SetColors=bg=%s\a' ${pick##*|}
+}
+
+# Attach a session, painting and tagging the iTerm pane with what it shows first
+attach_session() {
+  paint_pane $1
+  $HOME/.local/bin/ccc-tag --print $1
+  exec $tmux attach -d -t "=$1"
+}
+
+# Config dir of a Claude account, and the account of a config dir: work is
+# ~/.claude, oss is ~/.claude-perso, any other name <a> is ~/.claude-<a>
+account_dir() {
+  case $1 in
+    work|"") print -r -- $HOME/.claude ;;
+    oss) print -r -- $HOME/.claude-perso ;;
+    *) print -r -- $HOME/.claude-$1 ;;
+  esac
+}
+dir_account() {
+  local d=${1#CLAUDE_CONFIG_DIR=}
+  case ${d:t} in
+    .claude-perso) print oss ;;
+    .claude-*) print ${${d:t}#.claude-} ;;
+    *) print work ;;
+  esac
+}
+
+# A detached tmux session bound to account $1, in directory $2. The work
+# account leaves CLAUDE_CONFIG_DIR unset, as a plain `claude` does: the login's
+# Keychain entry name is derived from that setting
+create_session() {
+  if [[ "$1" == work ]]; then
+    $tmux new-session -d -P -F '#{session_name}' -c "$2" -e CCC_ACCOUNT=work
+  else
+    $tmux new-session -d -P -F '#{session_name}' -c "$2" -e CCC_ACCOUNT=$1 -e CLAUDE_CONFIG_DIR=$(account_dir $1)
+  fi
+}
+
+new_session() {
+  attach_session $(create_session $account $HOME)
+}
+
+claude_pid_of() {
+  pgrep -P $($tmux display -p -t "=$1:" '#{pane_pid}') -f '^claude' | head -1
+}
+
+# Account of a session: the running Claude's CLAUDE_CONFIG_DIR, else the one
+# the session was created with
+session_account() {
+  local pid=$(claude_pid_of $1) env
+  if [[ -n "$pid" ]]; then
+    dir_account "$(ps -E -ww -o command= -p $pid | grep -o 'CLAUDE_CONFIG_DIR=[^ ]*')"
+    return
+  fi
+  env=$($tmux show-environment -t "=$1" CCC_ACCOUNT 2>/dev/null)
+  [[ "$env" == CCC_ACCOUNT=* ]] && echo ${env#CCC_ACCOUNT=} || print -r -- "-"
+}
+
+# "<sessionId>\t<status>\t<name>\t<config dir>" from the file every Claude
+# keeps at <config dir>/sessions/<pid>.json
+claude_meta() {
+  local pid=$(claude_pid_of $1) cfg=$HOME/.claude
+  [[ -z "$pid" ]] && return
+  cfg=$(account_dir $(session_account $1))
+  [[ -f $cfg/sessions/$pid.json ]] || return
+  print -r -- "$(jq -r '[.sessionId, .status, (.name // "")] | @tsv' $cfg/sessions/$pid.json)"$'\t'"$cfg"
+}
+
+# The session's bilan score, the same file its status line reads; "-" when
+# the session has none (no bilan.sh in its repo, or never measured)
+session_bilan() {
+  local meta=$(claude_meta $1) sid cfg score rest
+  sid=${meta%%$'\t'*}; cfg=${meta##*$'\t'}
+  [[ -n "$sid" && -f $cfg/bilan/$sid.score ]] || { print -r -- "-"; return; }
+  IFS=$'\t' read -r score rest < $cfg/bilan/$sid.score
+  print -r -- ${score:--}
+}
+
+# shell: no Claude in the pane; working: Claude says busy, or it still runs
+# tools/background agents (zsh children sourcing its shell snapshot) while it
+# reports idle; waiting: Claude waits on a permission or a question; idle:
+# Claude waits for input
+session_state() {
+  local pid cstatus
+  [[ "$($tmux display -p -t "=$1:" '#{pane_current_command}')" == zsh ]] && { echo shell; return; }
+  pid=$(claude_pid_of $1)
+  cstatus=$(claude_meta $1 | cut -f2)
+  if [[ -n "$pid" ]] && pgrep -P $pid -f shell-snapshots >/dev/null; then
+    echo working
+  elif [[ "$cstatus" == idle ]]; then
+    echo idle
+  elif [[ "$cstatus" == waiting ]]; then
+    echo waiting
+  else
+    echo working
+  fi
+}
+
+# yes when a client of the session arrives over one of the local Mac's live connections
+session_here() {
+  local tty sshd peer
+  for tty in $($tmux list-clients -t "=$1" -F '#{client_tty}' 2>/dev/null); do
+    sshd=$(ps -axo pid=,command= | awk -v t="${tty#/dev/}" '$0 ~ "sshd-session: .*@.*"t"([^0-9]|$)" {print $1; exit}')
+    [[ -z "$sshd" ]] && continue
+    peer=$(lsof -nP -a -p $sshd -iTCP:22 -sTCP:ESTABLISHED 2>/dev/null | awk 'NR==2{print $9}')
+    [[ "$live_ports" == *",${peer##*:},"* ]] && { echo yes; return; }
+  done
+  echo no
+}
+
+session_title() {
+  if [[ "$(session_state $1)" == shell ]]; then
+    print -r -- ${$($tmux display -p -t "=$1:" '#{pane_current_path}')/#$HOME/\~}
+  else
+    local title=$($tmux display -p -t "=$1:" '#{pane_title}')
+    print -r -- ${title#✳ }
+  fi
+}
+
+sessions=("${(@f)$($tmux ls -F '#{session_name}' 2>/dev/null)}")
+[[ -z "${sessions[1]}" ]] && sessions=()
+
+if [[ "$mode" == tsv ]]; then
+  for s in $sessions; do
+    print -r -- "$s"$'\t'"$(session_account $s)"$'\t'"$(session_state $s)"$'\t'"$(session_here $s)"$'\t'"$(session_bilan $s)"$'\t'"$(session_title $s)"
+  done
+  exit 0
+fi
+
+if [[ -n "$attach" ]]; then
+  $tmux has-session -t "=$attach" 2>/dev/null && attach_session $attach
+  print "No session $attach on $(scutil --get LocalHostName)."
+  exit 1
+fi
+
+# Resume conversation $1 (named $2) on account $3 in a fresh tmux session, in
+# the folder it last ran in; every account can, since they share projects/
+resume_conversation() {
+  local id=$1 cname=$2 acct=${3:-work} transcript cwd name
+  transcript=$(print -l $HOME/.claude/projects/*/$id.jsonl(N) | head -1)
+  [[ -n "$id" && -n "$transcript" ]] || return 1
+  # the latest folder it worked in that still exists (a merged worktree is
+  # removed; an older folder of the same conversation is the next best)
+  cwd=""
+  for d in ${(Oa)${(f)"$(grep -o '"cwd":"[^"]*"' $transcript | cut -d'"' -f4)"}}; do
+    [[ -d "$d" ]] && { cwd=$d; break; }
+  done
+  [[ -n "$cwd" ]] || cwd=$HOME/workspace
+  name=$(create_session $acct "$cwd")
+  $tmux send-keys -t "=$name:" "claude --dangerously-skip-permissions --resume $id" Enter
+  print "Resuming ${cname:-$id} on the $acct account in session $name."
+  # tag now: the resumed Claude's own hook may fire before this pane attaches
+  printf '\033]1337;SetUserVar=cccClaude=%s\007' \
+    "$(printf '%s\t%s\t%s\t%s\t%s' "$id" "$cname" "$acct" "$name" "$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')" | base64)"
+  paint_pane $name
+  exec $tmux attach -d -t "=$name"
+}
+
+# The tmux session whose Claude runs conversation $1, else one named $2
+running_session() {
+  local s meta by_name=
+  for s in $sessions; do
+    meta=("${(@ps:\t:)$(claude_meta $s)}")
+    [[ -n "$1" && "$meta[1]" == "$1" ]] && { print -r -- $s; return; }
+    [[ -n "$2" && -z "$by_name" && "$meta[3]" == "$2" ]] && by_name=$s
+  done
+  print -r -- $by_name
+}
+
+if [[ -n "$tag" ]]; then
+  # split keeping empty fields: `read` would collapse adjacent tabs
+  fields=("${(@ps:\t:)$(print -r -- $tag | base64 -d)}")
+  want_id=$fields[1] want_name=$fields[2] want_acct=$fields[3] want_tmux=$fields[4]
+  # a tag from another Mac names a conversation and a session number that mean
+  # nothing here: drop it rather than attach whatever has that number
+  if [[ -n "${fields[5]:-}" && "${fields[5]}" != "$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')" ]]; then
+    tag="" want_id="" want_name="" want_acct="" want_tmux=""
+  fi
+fi
+
+# A conversation by id (or prefix): its running session, else resume it.
+# Returns (with a message) when the prefix matches no conversation, or several
+resume_by_id() {
+  local matches rid rname target racct
+  matches=(${(f)"$(print -l $HOME/.claude/projects/*/${1//[^0-9a-f-]/}*.jsonl(N))"})
+  if (( ${#matches} == 1 )); then
+    rid=${matches[1]:t:r}
+    rname=$(grep -o '"customTitle":"[^"]*"\|"aiTitle":"[^"]*"' $matches[1] | tail -1 | cut -d'"' -f4)
+    target=$(running_session "$rid" "")
+    if [[ -n "$target" ]]; then
+      racct=$(session_account $target)
+      # one conversation, one running Claude: a second one on another account
+      # would fork it, so moving it waits for the first to exit
+      if [[ -n "$account_named" && "$racct" != "$account" ]]; then
+        print "${rname:-$rid} runs on the $racct account in session $target. Exit Claude there, then run this again to resume it on $account."
+        exit 1
+      fi
+      print "Claude already runs ${rname:-$rid} in session $target; attaching it."
+      attach_session $target
+    fi
+    resume_conversation "$rid" "$rname" "$account"
+  fi
+  print "${#matches} saved conversations match '$1'."
+}
+
+if [[ "$mode" == resume ]]; then
+  resume_by_id "$resume_id"
+fi
+
+# Move this pane's conversation to another account: resume it there
+if [[ "$mode" == switch ]]; then
+  if [[ -z "${want_id:-}" ]]; then
+    print "This pane has no Claude conversation to switch; pick one:"
+  elif target=$(running_session "$want_id" ""); [[ -n "$target" ]]; then
+    print "Claude still runs ${want_name:-this conversation} in session $target; exit it there first (/exit), then ccc switch $account."
+    exit 1
+  else
+    resume_conversation "$want_id" "$want_name" "$account" && exit 0
+    print "No saved conversation ${want_id} to switch; pick one:"
+  fi
+fi
+
+# The pane's own conversation, from its tag
+if [[ "$mode" != list && "$mode" != new && "$mode" != switch && -n "$tag" ]]; then
+  target=$(running_session "$want_id" "$want_name")
+  # a pane that never ran Claude only has its tmux session to go back to
+  if [[ -z "$target" && -z "$want_id" && -n "$want_tmux" ]] && $tmux has-session -t "=$want_tmux" 2>/dev/null; then
+    target=$want_tmux
+  fi
+  if [[ -n "$target" ]]; then
+    print "Reconnected to session $target ($(session_title $target))."
+    attach_session $target
+  fi
+  # no Claude runs the conversation any more: resume it where it ran
+  resume_conversation "$want_id" "$want_name" "$want_acct"
+  print "Session ${want_name:-$want_tmux} is gone; pick one:"
+fi
+
+[[ "$mode" == new ]] && new_session
+(( ${#sessions} == 0 )) && [[ "$mode" != clean ]] && new_session
+
+# When session $1 last did real work: its conversation's last write when a
+# Claude runs there, else tmux's own activity. tmux counts every status-line
+# redraw as activity, so for a Claude session it reads "now" for all of them.
+session_last_active() {
+  local meta sid transcript
+  meta=$(claude_meta $1); sid=${meta%%$'\t'*}
+  if [[ -n "$sid" ]]; then
+    transcript=(${HOME}/.claude/projects/*/$sid.jsonl(N))
+    [[ -n "$transcript" ]] && { stat -f %m $transcript[1]; return; }
+  fi
+  $tmux display -p -t "=$1:" '#{session_activity}'
+}
+
+# Close session $1: its Claude through /exit, so the SessionEnd hooks run and
+# the conversation stays resumable by id, then whatever is left of the session
+close_session() {
+  local pid i forced=""
+  pid=$(claude_pid_of $1)
+  if [[ -n "$pid" ]]; then
+    # clear anything sitting in the prompt first (a stray terminal reply, say)
+    $tmux send-keys -t "=$1:" C-u
+    $tmux send-keys -t "=$1:" -l '/exit'
+    $tmux send-keys -t "=$1:" Enter
+    for i in {1..20}; do kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+    kill -0 $pid 2>/dev/null && forced=" (Claude did not exit; session killed)"
+  fi
+  $tmux kill-session -t "=$1" 2>/dev/null
+  print "  closed $1$forced"
+}
+
+# Finished sessions: a Claude idle at bilan 10 for over 2 hours, a plain shell
+# unused for over a day. One a client shows, or that is working or waiting, is
+# never touched; a Claude with no bilan has no completion signal, so it is only
+# listed for a decision by hand.
+if [[ "$mode" == clean ]]; then
+  close=() manual=()
+  for s in $sessions; do
+    [[ -n "$($tmux list-clients -t "=$s" 2>/dev/null)" ]] && continue
+    state=$(session_state $s); bilan=$(session_bilan $s)
+    idle_for=$(( EPOCHSECONDS - $(session_last_active $s) ))
+    case $state in
+      shell) (( idle_for > 86400 )) && close+=($s) ;;
+      idle)
+        if [[ "$bilan" == 10 ]]; then
+          (( idle_for > 7200 )) && close+=($s)
+        elif [[ "$bilan" == - ]]; then
+          (( idle_for > 7200 )) && manual+=($s)
+        fi ;;
+    esac
+  done
+  if (( ${#manual} )); then
+    print "No completion signal (no bilan); close by hand if done (ccc <n>, then /exit):"
+    for s in $manual; do print "  ${(r:4:)s} $(strftime '%a %H:%M' $(session_last_active $s))   $(session_title $s)"; done
+    print
+  fi
+  if (( ${#close} == 0 )); then
+    print "Nothing finished to close."
+    exit 0
+  fi
+  print "Finished (bilan 10 and idle 2 h+, or a shell unused 1 day+):"
+  for s in $close; do print "  ${(r:4:)s} $(strftime '%a %H:%M' $(session_last_active $s))   $(session_title $s)"; done
+  print -n "\nClose these ${#close} sessions? Conversations stay resumable by id. [y/N] "
+  read -r answer || exit 0
+  [[ "$answer" == [yY]* ]] || { print "Nothing closed."; exit 0; }
+  for s in $close; do close_session $s; done
+  exit 0
+fi
+
+# Rows sorted most recently active first
+rows=$(for s in $sessions; do
+  bilan=$(session_bilan $s)
+  activity=$(session_last_active $s)
+  print -r -- "-"$'\t'"$activity"$'\t'"$s"$'\t'"$bilan"
+done | sort -t$'\t' -k2,2nr)
+
+print -P "%B  #  account  bilan  state    here  last active   session%b"
+for row in ${(f)rows}; do
+  IFS=$'\t' read -r key activity s bilan <<< "$row"
+  acct=$(session_account $s); state=$(session_state $s); here=$(session_here $s)
+  acct_col=${(r:7:)acct}
+  case $acct in
+    oss) acct_col="%F{magenta}$acct_col%f" ;;
+    work|-) ;;
+    *) acct_col="%F{cyan}$acct_col%f" ;;
+  esac
+  # bilan colours match the status line: 10 green, 7-9 amber, lower red
+  case $bilan in
+    10) bilan_col="%F{green}${(r:5:)bilan}%f" ;;
+    7|8|9) bilan_col="%F{yellow}${(r:5:)bilan}%f" ;;
+    <->) bilan_col="%F{red}${(r:5:)bilan}%f" ;;
+    *) bilan_col="%F{8}${(r:5:)bilan}%f" ;;
+  esac
+  case $state in
+    shell) state_col="%F{8}shell  %f" ;;
+    idle) state_col="%F{green}idle   %f" ;;
+    waiting) state_col="%F{cyan}waiting%f" ;;
+    *) state_col="%F{yellow}working%f" ;;
+  esac
+  [[ "$here" == yes ]] && here_col="%F{green}yes %f" || here_col="%F{red}no  %f"
+  when=$(strftime '%a %H:%M' $activity)
+  width=$(( ${#s} > 2 ? ${#s} : 2 ))
+  print -P "  ${(r:width:)s} $acct_col  $bilan_col  $state_col  $here_col  $when     $(session_title $s)"
+done
+while true; do
+  print -n "\nSession number, conversation id, or Enter for a new $account session: "
+  read -r pick || exit 0
+  [[ -z "$pick" ]] && new_session
+  $tmux has-session -t "=$pick" 2>/dev/null && attach_session $pick
+  # an id (or 6+ character prefix) of a saved conversation no session shows
+  if [[ "$pick" =~ ^[0-9a-f][0-9a-f-]{5,}$ ]]; then
+    resume_by_id "$pick"
+    continue
+  fi
+  print "No session $pick."
+done

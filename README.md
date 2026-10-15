@@ -45,12 +45,15 @@ Claude accounts are config dirs, each selected by an alias that sets
 `CLAUDE_CONFIG_DIR` (`~/.claude` is the default account). They share everything
 through symlinks except the login.
 
+`remote/` holds what runs on the remote Mac, installed into its `~/.local/bin`
+(`scp remote/* ccc-remote:.local/bin/`): `ccc-tmux` (the session menu and
+reconnect logic), `ccc-tag` (tags each iTerm pane with its conversation) and
+`clip-set-png` (puts an image from `clip-to-remote` on the clipboard).
+
 Pieces that live outside this repo:
 
-- **Remote Mac** `~/.local/bin`: `ccc-tmux` (the session menu and reconnect
-  logic), `ccc-tag` (tags each iTerm pane with its conversation),
-  `clip-set-png`, `cclimits-guard` (copy of the hook); `~/.tmux.conf`; the SSH
-  block in `~/.zshrc`; a `caffeinate` LaunchAgent.
+- **Remote Mac** `~/.local/bin`: `cclimits-guard` (copy of the hook);
+  `~/.tmux.conf`; the SSH block in `~/.zshrc`; a `caffeinate` LaunchAgent.
 - **Both Macs** `~/.claude/settings.json`: the `ccc-tag`, `cclimits-guard` and `rtk-claude-hook` hooks; `~/.config/rtk/claude-accounts`; an rtk account's own `CLAUDE.md` importing the shared one plus `@RTK.md`.
 - **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
   `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`.

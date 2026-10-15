@@ -1,0 +1,65 @@
+#!/bin/zsh
+# ccc-tag: tag the local Mac's iTerm pane(s) showing a tmux session with the
+# Claude conversation it runs, so `ccc` there can reconnect to it by identity
+# after the connection drops. The tag is the iTerm user variable cccClaude =
+# "<conversation id>\t<name>\t<account>\t<tmux session>\t<host>", written as a raw
+# escape to each tmux client's terminal (the SSH pty), which iTerm keeps on
+# the pane after the connection dies. <host> is this Mac's LocalHostName in
+# lower case, which is also its ssh alias there: a bare `ccc` reconnects to
+# the Mac the pane last showed, and a Mac ignores another one's tag.
+#   ccc-tag             Claude Code SessionStart hook: hook JSON on stdin
+#   ccc-tag --print S   print the tag escape for tmux session S on stdout
+#                       (ccc-tmux runs it just before attaching)
+# Prints nothing else on stdout: a SessionStart hook's stdout reaches Claude.
+tmux=/opt/homebrew/bin/tmux
+host=$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')
+
+tag_escape() {
+  printf '\033]1337;SetUserVar=cccClaude=%s\007' \
+    "$(printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$host" | base64)"
+}
+
+# id, name and account of the Claude running in tmux session $1, from the
+# <config>/sessions/<pid>.json every Claude keeps
+claude_of() {
+  local sp pid cfg acct=work f
+  sp=$($tmux display -p -t "=$1:" '#{pane_pid}' 2>/dev/null) || return
+  pid=$(pgrep -P $sp -f '^claude' | head -1)
+  [[ -z "$pid" ]] && return
+  cfg=$HOME/.claude
+  cfg=$(ps -E -ww -o command= -p $pid | grep -o 'CLAUDE_CONFIG_DIR=[^ ]*' | cut -d= -f2)
+  case ${cfg:t} in
+    .claude-perso) acct=oss ;;
+    .claude-*) acct=${${cfg:t}#.claude-} ;;
+    *) cfg=$HOME/.claude; acct=work ;;
+  esac
+  f=$cfg/sessions/$pid.json
+  [[ -f $f ]] || return
+  print -r -- "$(jq -r '[.sessionId, (.name // "")] | @tsv' $f)"$'\t'"$acct"
+}
+
+if [[ "$1" == --print ]]; then
+  # split keeping empty fields: `read` would collapse adjacent tabs
+  meta=("${(@ps:\t:)$(claude_of $2)}")
+  tag_escape "$meta[1]" "$meta[2]" "$meta[3]" "$2"
+  exit 0
+fi
+
+# Hook mode: the conversation id comes from the hook input, since after a
+# /resume the session file can still name the previous one
+input=$(cat)
+[[ -n "$TMUX_PANE" ]] || exit 0
+session=$($tmux display -p -t "$TMUX_PANE" '#{session_name}')
+id=$(jq -r '.session_id // empty' <<< "$input")
+cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+case ${cfg:t} in
+  .claude-perso) acct=oss ;;
+  .claude-*) acct=${${cfg:t}#.claude-} ;;
+  *) acct=work ;;
+esac
+name=$(jq -r --arg id "$id" 'select(.sessionId == $id) | .name // empty' $cfg/sessions/*.json 2>/dev/null | head -1)
+esc=$(tag_escape "$id" "$name" "$acct" "$session")
+for tty in $($tmux list-clients -t "=$session" -F '#{client_tty}'); do
+  print -rn -- "$esc" > $tty
+done
+exit 0
