@@ -1,0 +1,228 @@
+#!/bin/zsh
+# hue: colour the current iTerm2 tab, so a wall of identical terminals stops
+# looking identical.
+#   hue                 # the next unused colour, remembered for this session:
+#                       # two tabs never come out the same, and re-running it
+#                       # in the same pane keeps the colour it already has
+#   hue red             # a name, or #ff8800 / ff8800 / f80
+#   hue repo            # colour from the git repo name instead, so every tab
+#                       # of one project matches (deliberately the same colour)
+#   hue auto prod       # colour from any string: a host, an env, a ticket
+#   hue off             # back to the profile default
+#   hue -t red          # tab only, leave the window background alone
+#   hue -l              # list the names and the auto palette
+#   hue -p red          # print the escapes instead of sending them
+# The tab gets the colour at full strength; the background gets it darkened to
+# HUE_TINT (default 64 of 255) so text stays readable. HUE_TINT=0 is tab-only.
+# A second run in the same pane is a no-op, so `hue >/dev/null` at the end of
+# .zshrc gives every new tab a colour of its own. Sessions are remembered in
+# $XDG_STATE_HOME/hue/sessions for a week after they are last seen.
+# Escapes go to /dev/tty, so `hue red | tee log` still colours the tab. Run from
+# somewhere with no terminal of its own — Claude Code's `!` prefix, a cron job —
+# there is nothing to colour, and hue says so rather than printing escapes at you.
+
+set -u
+
+# $0 inside a zsh function is the FUNCTION's name, so grab the script here
+SELF="${0:A}"
+
+typeset -A NAMED=(
+  red    e05252   orange e07b39   yellow d9b43c   amber  d9b43c
+  green  7fb53f   teal   3fb58a   cyan   5fb5b5   blue   3f9fd9
+  indigo 6a6fd9   purple 9a5fd0   pink   d05fa8   brown  9c6b4f
+  gray   9aa3ad   grey   9aa3ad   white  dddddd   black  222222
+)
+# What bare `hue` picks from: distinct at a glance, all readable as a tab tint.
+AUTO=(e05252 e07b39 d9b43c 7fb53f 3fb58a 3f9fd9 6a6fd9 9a5fd0 d05fa8 9c6b4f 5fb5b5 9aa3ad)
+
+ESC=$'\033'
+BEL=$'\a'
+TINT=${HUE_TINT:-64}   # brightest channel of the tinted background, 0-255
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hue/sessions"
+STATE_TTL=$(( 7 * 86400 ))
+
+# the header block above, minus the '#' (BSD sed has no \? and dislikes the
+# brace form this needs, so awk)
+usage() { awk 'NR>1 && /^#/ { sub(/^#[ ]?/, ""); print; next } NR>1 { exit }' "$SELF" }
+
+die() { print -ru2 -- "hue: $1"; exit 1 }
+
+# rrggbb for a name, #rrggbb, rrggbb or rgb; empty and non-zero for anything else.
+resolve() {
+  local c="${1#\#}"
+  if [[ -n "${NAMED[${c:l}]-}" ]]; then print -r -- "${NAMED[${c:l}]}"; return 0; fi
+  if [[ "$c" =~ '^[0-9a-fA-F]{3}$' ]]; then c="${c[1]}${c[1]}${c[2]}${c[2]}${c[3]}${c[3]}"; fi
+  if [[ "$c" =~ '^[0-9a-fA-F]{6}$' ]]; then print -r -- "${c:l}"; return 0; fi
+  return 1
+}
+
+# One terminal, one identity. The ITERM_SESSION_ID prefix (w0t1p0:) renumbers
+# when a tab moves, so key on the UUID after it. Inside tmux — a ccc pane on the
+# remote Mac, where iTerm's variable never arrives — the pane id serves instead.
+session_key() {
+  if [[ -n "${ITERM_SESSION_ID-}" ]]; then print -r -- "iterm:${ITERM_SESSION_ID##*:}"
+  elif [[ -n "${TMUX_PANE-}" ]]; then print -r -- "tmux:${HOST}${TMUX_PANE}"
+  else print -r -- "tty:${HOST}$(tty 2>/dev/null)"
+  fi
+}
+
+# The colour this session already has, or the one least used by the others, so
+# consecutive tabs come out different instead of colliding on a hash. Re-running
+# hue in a pane is therefore a no-op, which is what makes it safe in .zshrc.
+rotate() {
+  local key="$1" now=$(date +%s) colour c n best bestn tmp
+  mkdir -p "${STATE:h}"
+  [[ -f "$STATE" ]] || : > "$STATE"
+  # forget sessions not seen in a week, so their colours come back into play
+  tmp="$STATE.$$"
+  awk -F'\t' -v cut=$(( now - STATE_TTL )) '$3 + 0 >= cut' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+
+  colour=$(awk -F'\t' -v k="$key" '$1 == k { c = $2 } END { print c }' "$STATE")
+  if [[ -z "$colour" ]]; then
+    bestn=-1
+    for c in $AUTO; do
+      n=$(awk -F'\t' -v c="$c" '$2 == c' "$STATE" | wc -l | tr -d ' ')
+      if (( bestn < 0 || n < bestn )); then bestn=$n; best=$c; fi
+    done
+    colour=$best
+  fi
+  awk -F'\t' -v k="$key" '$1 != k' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  printf '%s\t%s\t%s\n' "$key" "$colour" "$now" >> "$STATE"
+  print -r -- "$colour"
+}
+
+forget() {
+  [[ -f "$STATE" ]] || return 0
+  local tmp="$STATE.$$"
+  awk -F'\t' -v k="$1" '$1 != k' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  return 0
+}
+
+# What `hue repo` colours by: the repo you are in, else the directory.
+seed() {
+  local root
+  if root=$(git rev-parse --show-toplevel 2>/dev/null); then print -r -- "${root:t}"
+  else print -r -- "${PWD:t}"
+  fi
+}
+
+# Same seed, same colour, on every Mac — cksum is stable, unlike $RANDOM or a hash
+# of anything that moves.
+pick() { print -r -- "${AUTO[$(( $(cksum <<< "$1" | cut -d' ' -f1) % ${#AUTO} + 1 ))]}" }
+
+# The same hue, dark enough to sit behind text: scale so the brightest channel
+# lands on TINT. Scaling (not a fixed blend) keeps the colour recognisable
+# whether it started bright or muted.
+darken() {
+  local r=$((16#${1[1,2]})) g=$((16#${1[3,4]})) b=$((16#${1[5,6]})) m
+  m=$r; (( g > m )) && m=$g; (( b > m )) && m=$b
+  (( m == 0 )) && { print -r -- "000000"; return }
+  # never brighten: a colour already darker than TINT is its own background
+  (( m <= TINT )) && { print -r -- "$1"; return }
+  printf '%02x%02x%02x' $(( r * TINT / m )) $(( g * TINT / m )) $(( b * TINT / m ))
+}
+
+swatch() { printf '%s[48;2;%d;%d;%dm  %s[0m' $ESC $((16#${1[1,2]})) $((16#${1[3,4]})) $((16#${1[5,6]})) $ESC }
+
+# iTerm2 takes the tab colour one channel at a time (OSC 6), and the window
+# background as a hex triple (OSC 1337). Inside tmux both need wrapping in a
+# passthrough, with every ESC doubled, or tmux eats them.
+send() {
+  local payload="$1"
+  [[ -n "${TMUX-}" ]] && payload="${ESC}Ptmux;${payload//$ESC/$ESC$ESC}${ESC}\\"
+  printf '%s' "$payload" >> $OUT
+}
+
+tab_colour() {
+  send "$(printf '%s]6;1;bg;red;brightness;%d%s%s]6;1;bg;green;brightness;%d%s%s]6;1;bg;blue;brightness;%d%s' \
+    $ESC $((16#${1[1,2]})) $BEL $ESC $((16#${1[3,4]})) $BEL $ESC $((16#${1[5,6]})) $BEL)"
+}
+tab_default() { send "${ESC}]6;1;bg;*;default${BEL}" }
+bg_colour()   { send "${ESC}]1337;SetColors=bg=${1}${BEL}" }
+
+apply() {
+  tab_colour "$1"
+  (( TINT > 0 )) && bg_colour "$(darken $1)"
+  return 0
+}
+
+tint_note() {
+  (( TINT > 0 )) || return 0
+  local d=$(darken $1)
+  printf ' on %s #%s' "$(swatch $d)" "$d"
+}
+
+args=()
+for a in "$@"; do
+  case "$a" in
+    -t|--tab)  TINT=0 ;;
+    -b|--bg)   ;;   # kept: the background is the default now, -b is a no-op
+    -p|--print) to_stdout=1 ;;
+    -l|--list) list=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        die "unknown option '$a' (see hue -h)" ;;
+    *)         args+=("$a") ;;
+  esac
+done
+
+if [[ -n "${list-}" ]]; then
+  print -r -- "names:"
+  for n in ${(ko)NAMED}; do
+    printf '  %s %-7s #%s  on %s #%s\n' "$(swatch ${NAMED[$n]})" "$n" "${NAMED[$n]}" "$(swatch $(darken ${NAMED[$n]}))" "$(darken ${NAMED[$n]})"
+  done
+  printf '\nauto palette: '
+  for c in $AUTO; do printf '%s' "$(swatch $c)"; done
+  printf '\n  as a background: '
+  for c in $AUTO; do printf '%s' "$(swatch $(darken $c))"; done
+  printf '\n\nthis session: %s  |  bare `hue` picks the least-used colour, then keeps it\n' "$(session_key)"
+  exit 0
+fi
+
+# A redirected stdout must not swallow the escapes. `-w /dev/tty` is NOT the test:
+# the device node is mode 666, so it reads writable even with no controlling
+# terminal, and the open then fails. Try the open itself, inside a group so the
+# shell's own "device not configured" goes to /dev/null with it.
+if [[ -n "${to_stdout-}" ]]; then
+  OUT=/dev/stdout
+elif { : >/dev/tty } 2>/dev/null; then
+  OUT=/dev/tty
+else
+  # No terminal to colour: a pipe-only caller, cron, or Claude Code's `!` prefix.
+  # Printing the escapes anyway just sprays them across someone's transcript, so
+  # say what happened and let -p ask for them on purpose.
+  die "no terminal here (Claude Code's '!' prefix? cron?) — nothing was coloured. Run hue at a shell prompt, or 'hue -p' to print the escapes."
+fi
+
+[[ "${TERM_PROGRAM-}" == "iTerm.app" || -n "${TMUX-}" ]] || \
+  print -ru2 -- "hue: TERM_PROGRAM is '${TERM_PROGRAM-unset}', not iTerm.app — sending anyway, other terminals ignore these."
+
+case "${args[1]-}" in
+  off|none|reset|default)
+    tab_default
+    bg_colour default
+    forget "$(session_key)"
+    print -r -- "hue: tab and background back to the profile default"
+    ;;
+  "")
+    colour=$(rotate "$(session_key)")
+    apply "$colour"
+    print -r -- "hue: $(swatch $colour) #$colour  (this session)$(tint_note $colour)"
+    ;;
+  repo)
+    s=$(seed)
+    colour=$(pick "$s")
+    apply "$colour"
+    print -r -- "hue: $(swatch $colour) #$colour  (repo: $s)$(tint_note $colour)"
+    ;;
+  auto)
+    s="${args[2]-$(seed)}"
+    colour=$(pick "$s")
+    apply "$colour"
+    print -r -- "hue: $(swatch $colour) #$colour  (auto: $s)$(tint_note $colour)"
+    ;;
+  *)
+    colour=$(resolve "${args[1]}") || die "not a colour: '${args[1]}' (try a name from 'hue -l', or #ff8800)"
+    apply "$colour"
+    print -r -- "hue: $(swatch $colour) #$colour$(tint_note $colour)"
+    ;;
+esac

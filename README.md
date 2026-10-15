@@ -83,6 +83,31 @@ Pieces that live outside this repo:
 | `dravr-deps` | Who depends on each `dravr-*` crate on crates.io. |
 | `dravr-sciotte-cleanup` | Yank every dravr-sciotte version, archive its Homebrew tap, delete its GHCR images. |
 
+## iTerm
+
+| Command | What it does |
+|---|---|
+| `hue` | Give this terminal the next colour nothing else is using, and remember it. Twelve tabs come out twelve different colours, and re-running it in the same pane returns the colour it already has. |
+| `hue red` / `hue '#ff8800'` | A name (`hue -l` lists them), or hex as `#ff8800`, `ff8800` or `f80`. |
+| `hue repo` | Colour from the git repo name instead, so every tab of one project matches on purpose. |
+| `hue auto <seed>` | Colour from any string: a host, an env, a ticket. |
+| `hue off` | Back to the profile default, tab and background, and the colour returns to the pool. |
+
+The tab gets the colour at full strength and the window background gets it
+darkened, so a whole pane is identifiable at a glance without hurting contrast.
+`HUE_TINT` (default 64 of 255) sets how bright that background is; `hue -t`, or
+`HUE_TINT=0`, colours the tab only.
+
+Sessions are keyed by `ITERM_SESSION_ID` (the UUID, which survives moving a tab),
+or by the tmux pane in a `ccc` pane on the remote Mac, and kept in
+`~/.local/state/hue/sessions` for a week after they are last seen. Because a
+second run is a no-op, `hue >/dev/null` is safe at the end of `.zshrc` — every
+new tab then colours itself.
+
+Run it at a shell prompt — through Claude Code's `!` prefix there is no terminal
+to colour, and `hue` says so instead of printing escapes at you (`-p` prints them
+on purpose).
+
 ## Notes and vaults
 
 | Command | What it does |
