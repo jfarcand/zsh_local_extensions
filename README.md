@@ -57,7 +57,9 @@ Pieces that live outside this repo:
   `~/.tmux.conf`; the SSH block in `~/.zshrc`; a `caffeinate` LaunchAgent.
 - **Both Macs** `~/.claude/settings.json`: the `ccc-tag`, `cclimits-guard` and `rtk-claude-hook` hooks; `~/.config/rtk/claude-accounts`; an rtk account's own `CLAUDE.md` importing the shared one plus `@RTK.md`.
 - **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
-  `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`.
+  `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`,
+  `local.pr-notify-<name>`; `pr-notify`'s notifier app in `~/Applications` and
+  its sound in `~/Library/Sounds`.
 - **This Mac** keychain item `ccc-remote-login`, and `ccc-<host>-login` per other
   remote Mac (or `$CCC_KEYCHAIN_ITEM`), which `ccc` uses to unlock the remote login keychain.
 - **Another remote Mac** gets the same remote pieces, its own `<alias>-fwd` ssh host and
@@ -71,6 +73,7 @@ Pieces that live outside this repo:
 | `ghactions` | Watch GitHub Actions runs for one or more repos (`-w` to refresh). |
 | `ghrate` | API rate-limit buckets and their reset times; alerts when low; `--callers` lists local processes talking to GitHub. |
 | `ghstats` | Stars and forks per repo, with daily deltas. |
+| `pr-notify <owner/repo>` | A macOS notification for each pull request opened since the last run; clicking it opens the PR. Runs under a `local.pr-notify-<name>` LaunchAgent every minute; an unchanged repo answers 304 to its ETag, which costs no rate limit. `PR_NOTIFY_APP` points at a copy of `terminal-notifier.app` with its own bundle id, so only these notifications can be set to stay on screen; `PR_NOTIFY_SOUND` names a sound in `~/Library/Sounds`. |
 | `killActions` | Cancel in-progress and queued workflow runs on a branch, or keep only the latest per workflow. |
 | `branch-cleanup` | Delete local branches whose remote branch is gone. |
 | `cr` | Create an issue, commit with `Fixes #n`, and push. |

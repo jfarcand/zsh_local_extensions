@@ -1,0 +1,50 @@
+#!/bin/bash
+# pr-notify: posts a macOS notification for each pull request opened on a
+# GitHub repository since the last run; clicking it opens the PR. Meant for a
+# LaunchAgent every minute: the request carries the last ETag, so GitHub
+# answers 304 when nothing changed and the check costs no rate limit. The
+# first run only records the newest PR, so installing it announces nothing.
+#   pr-notify <owner/repo>
+# PR_NOTIFY_APP    a copy of terminal-notifier.app with its own bundle id, so
+#                  its notification style (temporary or persistent) is its own
+# PR_NOTIFY_SOUND  sound name, from ~/Library/Sounds or /System/Library/Sounds
+# Offline or on any GitHub error the next run catches up; the first failure of
+# a streak, and the run that ends it, each print one line for the log.
+repo=${1:?usage: pr-notify <owner/repo>}
+app=${PR_NOTIFY_APP:-/opt/homebrew/opt/terminal-notifier/terminal-notifier.app}
+sound=${PR_NOTIFY_SOUND:-Glass}
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/pr-notify"
+mkdir -p "$dir"
+last_f="$dir/${repo//\//_}.last" etag_f="$dir/${repo//\//_}.etag" err_f="$dir/${repo//\//_}.err"
+
+cond=()
+[[ -s "$etag_f" && -s "$last_f" ]] && cond=(-H "If-None-Match: $(cat "$etag_f")")
+resp=$(gh api -i "${cond[@]}" "repos/$repo/pulls?state=all&sort=created&direction=desc&per_page=30" 2>&1)
+code=$(awk '/^HTTP\// { print $2; exit }' <<< "$resp")
+if [[ "$code" != 200 && "$code" != 304 ]]; then
+  [[ -f "$err_f" ]] || echo "$(date '+%F %T') pr-notify $repo: check failed (${code:-$(head -1 <<< "$resp")}); retrying every run"
+  touch "$err_f"
+  exit 0
+fi
+[[ -f "$err_f" ]] && rm -f "$err_f" && echo "$(date '+%F %T') pr-notify $repo: GitHub answers again"
+[[ "$code" == 200 ]] || exit 0
+etag=$(grep -i -m1 '^etag:' <<< "$resp" | cut -d' ' -f2- | tr -d '\r')
+body=$(awk 'seen; /^\r?$/ { seen = 1 }' <<< "$resp")
+newest=$(jq -r 'map(.number) | max // 0' <<< "$body") || exit 0
+
+last=$(cat "$last_f" 2>/dev/null)
+if [[ "$last" =~ ^[0-9]+$ ]]; then
+  first=true
+  while IFS=$'\t' read -r num author url title; do
+    [[ -n "$num" ]] || continue
+    s=(); $first && s=(-sound "$sound")   # one burst per batch, not one per PR
+    "$app/Contents/MacOS/terminal-notifier" -title "New PR #$num · ${repo#*/}" \
+      -subtitle "by $author" -message "$title" -open "$url" -group "$repo#$num" "${s[@]}" > /dev/null
+    first=false
+  done < <(jq -r --argjson last "$last" \
+    'map(select(.number > $last)) | sort_by(.number)[] | [.number, .user.login, .html_url, .title] | @tsv' <<< "$body")
+  (( newest > last )) || newest=$last
+fi
+echo "$newest" > "$last_f"
+[[ -n "$etag" ]] && echo "$etag" > "$etag_f"
+exit 0
