@@ -40,6 +40,8 @@ if [[ "$last" =~ ^[0-9]+$ ]]; then
     s=(); $first && s=(-sound "$sound")   # one burst per batch, not one per PR
     "$app/Contents/MacOS/terminal-notifier" -title "New PR #$num · ${repo#*/}" \
       -subtitle "by $author" -message "$title" -open "$url" -group "$repo#$num" "${s[@]}" > /dev/null
+    rc=$?
+    echo "$(date '+%F %T') pr-notify $repo: notified #$num by $author (exit $rc)"
     first=false
   done < <(jq -r --argjson last "$last" \
     'map(select(.number > $last)) | sort_by(.number)[] | [.number, .user.login, .html_url, .title] | @tsv' <<< "$body")
