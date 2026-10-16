@@ -219,21 +219,82 @@ resume_conversation() {
   $tmux send-keys -t "=$name:" "claude --dangerously-skip-permissions --resume $id" Enter
   print "Resuming ${cname:-$id} on the $acct account in session $name."
   # tag now: the resumed Claude's own hook may fire before this pane attaches
-  printf '\033]1337;SetUserVar=cccClaude=%s\007' \
-    "$(printf '%s\t%s\t%s\t%s\t%s' "$id" "$cname" "$acct" "$name" "$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')" | base64)"
+  tag_pane "$id" "$cname" "$acct" "$name"
   paint_pane $name
   exec $tmux attach -d -t "=$name"
 }
 
-# The tmux session whose Claude runs conversation $1, else one named $2
+# Tag the asking iTerm pane with conversation $1 (named $2, account $3) in
+# tmux session $4, as ccc-tag does
+tag_pane() {
+  printf '\033]1337;SetUserVar=cccClaude=%s\007' \
+    "$(printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')" | base64)"
+}
+
+# The conversation a pane's Claude was started on, from its command line:
+# `--resume <id>`, or `attach <id>` for a view of a background session. It
+# covers a Claude with no sessions file yet: one stuck on the folder-trust
+# question never writes it, and every reconnect resumed it once more
+claude_cmd_id() {
+  local pid=$(claude_pid_of $1)
+  [[ -n "$pid" ]] || return
+  ps -ww -o command= -p $pid | grep -oE '(--resume|attach) [0-9a-f][0-9a-f-]{5,}' | head -1 | cut -d' ' -f2
+}
+
+# The tmux session whose Claude runs conversation $1, else one whose Claude
+# was started on it or that shows it from the background host, else one
+# named $2
 running_session() {
-  local s meta by_name=
+  local s meta cid by_cmd= by_name=
   for s in $sessions; do
+    if [[ -n "$1" && -z "$by_cmd" && "$($tmux show-options -qv -t "=$s:" @ccc_background)" == "$1" &&
+          "$($tmux display -p -t "=$s:" '#{pane_current_command}')" != zsh ]]; then
+      by_cmd=$s
+    fi
     meta=("${(@ps:\t:)$(claude_meta $s)}")
     [[ -n "$1" && "$meta[1]" == "$1" ]] && { print -r -- $s; return; }
+    if [[ -n "$1" && -z "$meta[1]" && -z "$by_cmd" ]]; then
+      cid=$(claude_cmd_id $s)
+      [[ -n "$cid" && "$1" == ${cid}* ]] && by_cmd=$s
+    fi
     [[ -n "$2" && -z "$by_name" && "$meta[3]" == "$2" ]] && by_name=$s
   done
-  print -r -- $by_name
+  print -r -- ${by_cmd:-$by_name}
+}
+
+# Conversation $1 running in Claude Code's own background host, outside tmux:
+# "<short id>\t<account>\t<name>" of the live one, from each account's
+# `claude agents` list
+background_session() {
+  local d out hit claude=${commands[claude]:-$HOME/.local/bin/claude}
+  [[ -n "$1" ]] || return 1
+  for d in $HOME/.claude $HOME/.claude-*(N/); do
+    [[ -d $d/sessions ]] || continue
+    if [[ $d == $HOME/.claude ]]; then
+      out=$(env -u CLAUDE_CONFIG_DIR $claude agents --json 2>/dev/null)
+    else
+      out=$(CLAUDE_CONFIG_DIR=$d $claude agents --json 2>/dev/null)
+    fi
+    hit=$(jq -r --arg id "$1" 'first(.[] | select(.kind == "background" and (.pid // 0) > 0 and .sessionId == $id)) | [.id, .name // ""] | @tsv' <<< "$out" 2>/dev/null)
+    [[ -n "$hit" ]] && { print -r -- "${hit%%$'\t'*}"$'\t'"$(dir_account $d)"$'\t'"${hit#*$'\t'}"; return 0; }
+  done
+  return 1
+}
+
+# Show background session $1 (short id) of conversation $2, named $3, on
+# account $4, from a fresh tmux session: resuming it instead would start a
+# second Claude on the same conversation, and a view in tmux comes back after
+# a dropped connection like any other session
+attach_background() {
+  local name
+  name=$(create_session $4 $HOME)
+  # the view's own command line soon reads `claude agents`, whatever it shows
+  $tmux set-option -t "=$name:" @ccc_background "$2"
+  $tmux send-keys -t "=$name:" "claude attach $1" Enter
+  print "${3:-$2} runs in Claude Code's background host; showing it in session $name."
+  tag_pane "$2" "$3" "$4" "$name"
+  paint_pane $name
+  exec $tmux attach -d -t "=$name"
 }
 
 if [[ -n "$tag" ]]; then
@@ -250,7 +311,7 @@ fi
 # A conversation by id (or prefix): its running session, else resume it.
 # Returns (with a message) when the prefix matches no conversation, or several
 resume_by_id() {
-  local matches rid rname target racct
+  local matches rid rname target racct bg
   matches=(${(f)"$(print -l $HOME/.claude/projects/*/${1//[^0-9a-f-]/}*.jsonl(N))"})
   if (( ${#matches} == 1 )); then
     rid=${matches[1]:t:r}
@@ -266,6 +327,14 @@ resume_by_id() {
       fi
       print "Claude already runs ${rname:-$rid} in session $target; attaching it."
       attach_session $target
+    fi
+    if bg=$(background_session "$rid"); then
+      bg=("${(@ps:\t:)bg}")
+      if [[ -n "$account_named" && "$bg[2]" != "$account" ]]; then
+        print "${rname:-$rid} runs on the $bg[2] account in Claude Code's background host. Stop it there (claude stop $bg[1]), then run this again to resume it on $account."
+        exit 1
+      fi
+      attach_background "$bg[1]" "$rid" "${bg[3]:-$rname}" "$bg[2]"
     fi
     resume_conversation "$rid" "$rname" "$account"
   fi
@@ -283,6 +352,9 @@ if [[ "$mode" == switch ]]; then
   elif target=$(running_session "$want_id" ""); [[ -n "$target" ]]; then
     print "Claude still runs ${want_name:-this conversation} in session $target; exit it there first (/exit), then ccc switch $account."
     exit 1
+  elif bg=$(background_session "$want_id"); then
+    print "${want_name:-This conversation} runs in Claude Code's background host; stop it first (claude stop ${bg%%$'\t'*}), then ccc switch $account."
+    exit 1
   else
     resume_conversation "$want_id" "$want_name" "$account" && exit 0
     print "No saved conversation ${want_id} to switch; pick one:"
@@ -299,6 +371,10 @@ if [[ "$mode" != list && "$mode" != new && "$mode" != switch && -n "$tag" ]]; th
   if [[ -n "$target" ]]; then
     print "Reconnected to session $target ($(session_title $target))."
     attach_session $target
+  fi
+  if bg=$(background_session "$want_id"); then
+    bg=("${(@ps:\t:)bg}")
+    attach_background "$bg[1]" "$want_id" "${bg[3]:-$want_name}" "$bg[2]"
   fi
   # no Claude runs the conversation any more: resume it where it ran
   resume_conversation "$want_id" "$want_name" "$want_acct"
