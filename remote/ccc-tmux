@@ -198,8 +198,13 @@ fi
 
 if [[ -n "$attach" ]]; then
   $tmux has-session -t "=$attach" 2>/dev/null && attach_session $attach
-  print "No session $attach on $(scutil --get LocalHostName)."
-  exit 1
+  # a conversation id made only of digits arrives as a session number
+  if [[ "$attach" =~ ^[0-9a-f][0-9a-f-]{5,}$ ]]; then
+    mode=resume resume_id=$attach
+  else
+    print "No session $attach on $(scutil --get LocalHostName)."
+    exit 1
+  fi
 fi
 
 # Resume conversation $1 (named $2) on account $3 in a fresh tmux session, in
@@ -262,12 +267,11 @@ running_session() {
   print -r -- ${by_cmd:-$by_name}
 }
 
-# Conversation $1 running in Claude Code's own background host, outside tmux:
-# "<short id>\t<account>\t<name>" of the live one, from each account's
-# `claude agents` list
-background_session() {
-  local d out hit claude=${commands[claude]:-$HOME/.local/bin/claude}
-  [[ -n "$1" ]] || return 1
+# The live sessions in Claude Code's own background host, outside tmux, from
+# each account's `claude agents` list:
+# "<short id>\t<account>\t<status>\t<conversation id>\t<name>"
+background_rows() {
+  local d out claude=${commands[claude]:-$HOME/.local/bin/claude}
   for d in $HOME/.claude $HOME/.claude-*(N/); do
     [[ -d $d/sessions ]] || continue
     if [[ $d == $HOME/.claude ]]; then
@@ -275,10 +279,17 @@ background_session() {
     else
       out=$(CLAUDE_CONFIG_DIR=$d $claude agents --json 2>/dev/null)
     fi
-    hit=$(jq -r --arg id "$1" 'first(.[] | select(.kind == "background" and (.pid // 0) > 0 and .sessionId == $id)) | [.id, .name // ""] | @tsv' <<< "$out" 2>/dev/null)
-    [[ -n "$hit" ]] && { print -r -- "${hit%%$'\t'*}"$'\t'"$(dir_account $d)"$'\t'"${hit#*$'\t'}"; return 0; }
-  done
-  return 1
+    jq -r --arg a "$(dir_account $d)" '.[] | select(.kind == "background" and (.pid // 0) > 0)
+      | [.id, $a, (.status // "-"), .sessionId, (.name // "")] | @tsv' <<< "$out" 2>/dev/null
+  done | sort -u -t$'\t' -k4,4
+}
+
+# Conversation $1 in the background host: "<short id>\t<account>\t<name>"
+background_session() {
+  local hit
+  [[ -n "$1" ]] || return 1
+  hit=$(background_rows | awk -F'\t' -v id="$1" '$4 == id { print $1 "\t" $2 "\t" $5; exit }')
+  [[ -n "$hit" ]] && print -r -- "$hit"
 }
 
 # Show background session $1 (short id) of conversation $2, named $3, on
@@ -459,34 +470,56 @@ rows=$(for s in $sessions; do
   print -r -- "-"$'\t'"$activity"$'\t'"$s"$'\t'"$bilan"
 done | sort -t$'\t' -k2,2nr)
 
-print -P "%B  #  account  bilan  state    here  last active   session%b"
-for row in ${(f)rows}; do
-  IFS=$'\t' read -r key activity s bilan <<< "$row"
-  acct=$(session_account $s); state=$(session_state $s); here=$(session_here $s)
-  acct_col=${(r:7:)acct}
-  case $acct in
+# One menu row: key (a session number, or a background session's id),
+# account, bilan, state, here, last activity (epoch), title
+print_row() {
+  local acct_col=${(r:7:)2} bilan_col state_col here_col width
+  case $2 in
     oss) acct_col="%F{magenta}$acct_col%f" ;;
     work|-) ;;
     *) acct_col="%F{cyan}$acct_col%f" ;;
   esac
   # bilan colours match the status line: 10 green, 7-9 amber, lower red
-  case $bilan in
-    10) bilan_col="%F{green}${(r:5:)bilan}%f" ;;
-    7|8|9) bilan_col="%F{yellow}${(r:5:)bilan}%f" ;;
-    <->) bilan_col="%F{red}${(r:5:)bilan}%f" ;;
-    *) bilan_col="%F{8}${(r:5:)bilan}%f" ;;
+  case $3 in
+    10) bilan_col="%F{green}${(r:5:)3}%f" ;;
+    7|8|9) bilan_col="%F{yellow}${(r:5:)3}%f" ;;
+    <->) bilan_col="%F{red}${(r:5:)3}%f" ;;
+    *) bilan_col="%F{8}${(r:5:)3}%f" ;;
   esac
-  case $state in
+  case $4 in
     shell) state_col="%F{8}shell  %f" ;;
     idle) state_col="%F{green}idle   %f" ;;
     waiting) state_col="%F{cyan}waiting%f" ;;
     *) state_col="%F{yellow}working%f" ;;
   esac
-  [[ "$here" == yes ]] && here_col="%F{green}yes %f" || here_col="%F{red}no  %f"
-  when=$(strftime '%a %H:%M' $activity)
-  width=$(( ${#s} > 2 ? ${#s} : 2 ))
-  print -P "  ${(r:width:)s} $acct_col  $bilan_col  $state_col  $here_col  $when     $(session_title $s)"
+  [[ "$5" == yes ]] && here_col="%F{green}yes %f" || here_col="%F{red}no  %f"
+  width=$(( ${#1} > 2 ? ${#1} : 2 ))
+  print -P "  ${(r:width:)1} $acct_col  $bilan_col  $state_col  $here_col  $(strftime '%a %H:%M' $6)     $7"
+}
+
+print -P "%B  #  account  bilan  state    here  last active   session%b"
+for row in ${(f)rows}; do
+  IFS=$'\t' read -r key activity s bilan <<< "$row"
+  print_row $s "$(session_account $s)" "$bilan" "$(session_state $s)" "$(session_here $s)" "$activity" "$(session_title $s)"
 done
+
+# Sessions in Claude Code's own background host that no tmux session shows;
+# picking one's id opens it in a tmux session of its own
+bg_rows=$(background_rows | while IFS=$'\t' read -r bid bacct bstatus bsid bname; do
+  [[ -n "$(running_session "$bsid" "")" ]] && continue
+  transcript=(${HOME}/.claude/projects/*/$bsid.jsonl(N))
+  activity=0; [[ -n "$transcript" ]] && activity=$(stat -f %m $transcript[1])
+  bilan=-; [[ -f $(account_dir $bacct)/bilan/$bsid.score ]] && read -r bilan rest < $(account_dir $bacct)/bilan/$bsid.score
+  case $bstatus in idle|waiting) ;; *) bstatus=working ;; esac
+  print -r -- "$activity"$'\t'"$bid"$'\t'"$bacct"$'\t'"${bilan:--}"$'\t'"$bstatus"$'\t'"$bname"
+done | sort -t$'\t' -k1,1nr)
+if [[ -n "$bg_rows" ]]; then
+  print -P "\n%B  Claude Code's background host%b %F{244}(no tmux session; type the id to open one)%f"
+  for row in ${(f)bg_rows}; do
+    IFS=$'\t' read -r activity bid bacct bilan bstatus bname <<< "$row"
+    print_row $bid $bacct "$bilan" $bstatus no "$activity" "$bname"
+  done
+fi
 while true; do
   print -n "\nSession number, conversation id, or Enter for a new $account session: "
   read -r pick || exit 0
