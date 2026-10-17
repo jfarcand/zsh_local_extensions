@@ -13,9 +13,17 @@ name=$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
 name=${name#.}
 f="${XDG_STATE_HOME:-$HOME/.local/state}/cclimits/guard/$name"
 [[ -f "$f" ]] || exit 0
-IFS=$'\t' read -r until reason < "$f" || true
+IFS=$'\t' read -r until reason login < "$f" || true
 [[ "$until" =~ ^[0-9]+$ ]] || exit 0
 (( $(date +%s) < until )) || exit 0
+# The block names the login it was set for ("<email>|<organization uuid>"); the
+# list reaches every Mac by config dir name, and this Mac's dir of that name
+# may hold another login, which is not at that limit. Unknown here: blocked.
+if [[ -n "$login" ]]; then
+  acct_file="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/.claude.json}"
+  here=$(jq -r '.oauthAccount // {} | (.emailAddress // "") + "|" + (.organizationUuid // "")' "${acct_file:-$HOME/.claude.json}" 2>/dev/null)
+  [[ -n "$here" && "$here" != "|" && "$here" != "$login" ]] && exit 0
+fi
 cat > /dev/null
 echo "cclimits guard: $name is blocked until $(date -r "$until" '+%H:%M') — $reason. Stop here: every further request bills the organization's extra usage. (Override: rm $f)" >&2
 exit 2
