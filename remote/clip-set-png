@@ -1,8 +1,0 @@
-#!/bin/zsh
-# clip-set-png: put the PNG image read from stdin on this Mac's clipboard.
-# The local Mac's clip-to-remote agent pipes every image copied there into it,
-# so pasting in Claude Code here works without Universal Clipboard.
-f=$(mktemp -t clip).png
-trap 'rm -f $f' EXIT
-cat > $f
-osascript -e "set the clipboard to (read (POSIX file \"$f\") as «class PNGf»)"

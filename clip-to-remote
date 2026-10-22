@@ -4,9 +4,10 @@
 // Claude Code running there (over ccc) works. Universal Clipboard does not
 // deliver reliably while the remote Mac's screen sleeps or is locked, nor off
 // the local network at all.
-// Runs under the local.clip-to-remote LaunchAgent; the remote ~/.local/bin/clip-set-png
-// receives a PNG on stdin, the remote pbcopy receives text. Text a password
-// manager marks concealed or transient never leaves this Mac.
+// Runs under the local.clip-to-remote LaunchAgent; the remote ~/.local/bin/clip-set
+// receives each copy on stdin. Text a password manager marks concealed or
+// transient never leaves this Mac, and what clip-from-remote put here (it came
+// from the remote Mac) is never sent back.
 ObjC.import('AppKit');
 
 const app = Application.currentApplication();
@@ -20,10 +21,12 @@ let last = pasteboard.changeCount;
 let sent = null;
 let sentText = null;
 
-// nspasteboard.org markers: password managers flag secrets so clipboard tools skip them
-function isSecret() {
+// nspasteboard.org markers: password managers flag secrets so clipboard tools
+// skip them; clip-set marks what it put on the clipboard as local.clip-sync
+function skip() {
   const types = ObjC.deepUnwrap(pasteboard.types) || [];
-  return types.includes('org.nspasteboard.ConcealedType') ||
+  return types.includes('local.clip-sync') ||
+    types.includes('org.nspasteboard.ConcealedType') ||
     types.includes('org.nspasteboard.TransientType');
 }
 
@@ -51,18 +54,18 @@ while (true) {
   const count = pasteboard.changeCount;
   if (count === last) continue;
   last = count;
-  if (isSecret()) continue;
+  if (skip()) continue;
   const data = clipboardPng();
   if (data) {
     if (sent && data.isEqualToData(sent)) continue;
     sent = data;
     data.writeToFileAtomically(png, true);
-    send('.local/bin/clip-set-png', png, 'image');
+    send('.local/bin/clip-set png', png, 'image');
     continue;
   }
   const text = pasteboard.stringForType($.NSPasteboardTypeString);
   if (text.isNil() || text.length === 0 || (sentText && text.isEqualToString(sentText))) continue;
   sentText = text;
   text.writeToFileAtomicallyEncodingError(txt, true, $.NSUTF8StringEncoding, $());
-  send('LC_CTYPE=UTF-8 pbcopy', txt, 'text');
+  send('.local/bin/clip-set text', txt, 'text');
 }

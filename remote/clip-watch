@@ -1,0 +1,49 @@
+#!/usr/bin/osascript -l JavaScript
+// clip-watch: print every image and text put on this Mac's clipboard to stdout,
+// one line each: "png <base64>" or "text <base64>". clip-from-remote on the
+// local Mac runs it over ssh and puts each line on the local clipboard.
+// Skips what clip-set put there (it came from the other Mac) and text a
+// password manager marks concealed or transient, which never leaves this Mac.
+ObjC.import('AppKit');
+
+const pasteboard = $.NSPasteboard.generalPasteboard;
+const out = $.NSFileHandle.fileHandleWithStandardOutput;
+let last = pasteboard.changeCount;
+let sent = null;
+
+function skip() {
+  const types = ObjC.deepUnwrap(pasteboard.types) || [];
+  return types.includes('local.clip-sync') ||
+    types.includes('org.nspasteboard.ConcealedType') ||
+    types.includes('org.nspasteboard.TransientType');
+}
+
+function emit(kind, data) {
+  if (sent && data.isEqualToData(sent)) return;
+  sent = data;
+  const line = kind + ' ' + data.base64EncodedStringWithOptions(0).js + '\n';
+  out.writeData($(line).dataUsingEncoding($.NSUTF8StringEncoding));
+}
+
+// PNG bytes of the clipboard image, converting TIFF (screenshots, many apps)
+function clipboardPng() {
+  const data = pasteboard.dataForType($.NSPasteboardTypePNG);
+  if (!data.isNil()) return data;
+  const tiff = pasteboard.dataForType($.NSPasteboardTypeTIFF);
+  if (tiff.isNil()) return null;
+  return $.NSBitmapImageRep.imageRepWithData(tiff)
+    .representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+}
+
+while (true) {
+  delay(1);
+  const count = pasteboard.changeCount;
+  if (count === last) continue;
+  last = count;
+  if (skip()) continue;
+  const png = clipboardPng();
+  if (png) { emit('png', png); continue; }
+  const text = pasteboard.stringForType($.NSPasteboardTypeString);
+  if (text.isNil() || text.length === 0) continue;
+  emit('text', text.dataUsingEncoding($.NSUTF8StringEncoding));
+}

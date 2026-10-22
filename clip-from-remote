@@ -1,0 +1,19 @@
+#!/bin/zsh
+# clip-from-remote: copy every image and text put on the remote Mac's clipboard
+# (ssh alias ccc-remote, or $CCC_HOST) to this Mac's clipboard; the other half
+# of clip-to-remote. Runs under the local.clip-from-remote LaunchAgent: it keeps
+# one ssh connection running the remote ~/.local/bin/clip-watch, puts each line
+# it prints on the clipboard through remote/clip-set, and reconnects when the
+# connection drops.
+host=${CCC_HOST:-ccc-remote}
+set_clip=${0:A:h}/remote/clip-set
+while true; do
+  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 "$host" .local/bin/clip-watch |
+    while read -r kind b64; do
+      [[ "$kind" == text || "$kind" == png ]] || continue
+      print -rn -- "$b64" | /usr/bin/base64 -D | "$set_clip" "$kind"
+    done
+  echo "$(date '+%F %T') clip-from-remote: connection to $host ended, reconnecting" >&2
+  sleep 10
+done

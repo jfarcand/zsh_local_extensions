@@ -37,6 +37,7 @@ Mac is the SSH host `ccc-remote` (define it in `~/.ssh/config`, or set
 | `tunnel [@<alias>] [port…]` | Forward localhost ports to the remote Mac (or `@<alias>`) until Ctrl-C. Bare `tunnel` finds the callback port of a pending `/login` there. |
 | `ccc-forward` | The connection behind the `local.ccc-forward` LaunchAgent: the remote dev ports, the gcloud login callback, and the URL-back channel. |
 | `clip-to-remote` | Runs under the `local.clip-to-remote` LaunchAgent: copies every image and text put on this Mac's clipboard to the remote Mac's, so pasting in Claude there works; text a password manager marks concealed stays here. |
+| `clip-from-remote` | The other direction, under the `local.clip-from-remote` LaunchAgent: keeps one ssh connection running the remote `clip-watch` and puts every image and text copied on the remote Mac on this Mac's clipboard. Both directions mark what they set (`local.clip-sync`), so a copy is never sent back to the Mac it came from. |
 | `cclimits` | Usage limits of every logged-in Claude account, side by side, with alerts; shows a Team account's organization and any extra-usage spend. `cclimits -w 120` watches. |
 | `cclimits -g` | Guard: blocks an account that is at 100% of a limit while its org's extra usage would bill every further request. Alone it runs one silent pass (the `local.cclimits-guard` LaunchAgent, every 5 min); with `-w` it guards on each refresh. `CCLIMITS_GUARD_HOSTS` lists the ssh hosts that get the block list. |
 | `cclimits-guard` | The Claude Code hook (UserPromptSubmit + PreToolUse) that refuses prompts and tool calls for a blocked account. A session started with `ANTHROPIC_API_KEY` bills the key's Console organization instead, so it is let through. A block names the login it was set for (email and organization), so a Mac whose config dir of that name holds another login is not blocked. |
@@ -48,8 +49,10 @@ through symlinks except the login.
 
 `remote/` holds what runs on the remote Mac, installed into its `~/.local/bin`
 (`scp remote/* ccc-remote:.local/bin/`): `ccc-tmux` (the session menu and
-reconnect logic), `ccc-tag` (tags each iTerm pane with its conversation) and
-`clip-set-png` (puts an image from `clip-to-remote` on the clipboard).
+reconnect logic), `ccc-tag` (tags each iTerm pane with its conversation),
+`clip-set` (puts a synced text or image on the clipboard; this Mac's
+`clip-from-remote` uses it too) and `clip-watch` (prints the remote Mac's copies
+for `clip-from-remote`).
 
 Pieces that live outside this repo:
 
@@ -57,7 +60,7 @@ Pieces that live outside this repo:
   `~/.tmux.conf`; the SSH block in `~/.zshrc`; a `caffeinate` LaunchAgent.
 - **Both Macs** `~/.claude/settings.json`: the `ccc-tag`, `cclimits-guard` and `rtk-claude-hook` hooks; `~/.config/rtk/claude-accounts`; an rtk account's own `CLAUDE.md` importing the shared one plus `@RTK.md`.
 - **This Mac** `~/Library/LaunchAgents`: `local.url-listener`,
-  `local.ccc-forward`, `local.clip-to-remote`, `local.cclimits-guard`,
+  `local.ccc-forward`, `local.clip-to-remote`, `local.clip-from-remote`, `local.cclimits-guard`,
   `local.pr-notify-<name>`; `pr-notify`'s notifier app in `~/Applications` and
   its sound in `~/Library/Sounds`.
 - **This Mac** keychain item `ccc-remote-login`, and `ccc-<host>-login` per other

@@ -1,0 +1,28 @@
+#!/bin/zsh
+# clip-set: put the text or PNG image read from stdin on this Mac's clipboard,
+# marked as synced so clip-to-remote and clip-watch never send it back.
+# Usage: clip-set text|png < data. clip-to-remote pipes the local Mac's copies
+# into it on the remote Mac, and clip-from-remote pipes the remote Mac's copies
+# into it on the local Mac.
+kind=$1
+[[ "$kind" == text || "$kind" == png ]] || { echo "usage: clip-set text|png < data" >&2; exit 2; }
+f=$(mktemp -t clip-set)
+trap 'rm -f $f' EXIT
+cat > $f
+/usr/bin/osascript -l JavaScript - "$kind" "$f" <<'EOF'
+ObjC.import('AppKit');
+function run(argv) {
+  const [kind, file] = argv;
+  const data = $.NSData.dataWithContentsOfFile(file);
+  if (data.isNil() || data.length === 0) return;
+  const pb = $.NSPasteboard.generalPasteboard;
+  pb.clearContents;
+  pb.setDataForType($.NSData.data, 'local.clip-sync');
+  if (kind === 'png') {
+    pb.setDataForType(data, $.NSPasteboardTypePNG);
+  } else {
+    const text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+    pb.setStringForType(text, $.NSPasteboardTypeString);
+  }
+}
+EOF
