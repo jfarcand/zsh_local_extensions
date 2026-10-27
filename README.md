@@ -69,6 +69,21 @@ Pieces that live outside this repo:
   `local.ccc-forward-<alias>` LaunchAgent for the URL-back channel, and a place in
   `CCLIMITS_GUARD_HOSTS`.
 
+## Fan control
+
+`fanctl/` replaces Macs Fan Control on a Mac with a noisy fan (douche): a small C
+tool that talks to the SMC directly. It is built on that Mac, not put on `PATH`.
+
+| Command | What it does |
+|---|---|
+| `fanctl status` | Each fan's speed, target, min/max and mode, and the hottest CPU sensor. No root. |
+| `sudo fanctl set <rpm>` / `sudo fanctl auto` | Force every fan to a speed / hand them back to the SMC. |
+| `sudo fanctl daemon [--rpm N] [--ramp-from C] [--ramp-to C]` | Hold `N` rpm (0 = the fan's minimum); above `ramp-from` °C, ramp linearly to the fan's maximum at `ramp-to`. No temperature reading means full speed. Re-asserts every 3 s, since sleep and wake hand the fan back to the SMC, and restores auto when stopped. |
+| `sudo fanctl/install.sh [uninstall]` | Build it, install `/usr/local/bin/fanctl` and the `local.fanctl` LaunchDaemon (`--rpm 0 --ramp-from 75 --ramp-to 95`, starts at boot, restarted if it dies, log in `/var/log/fanctl.log`) — or remove both. |
+| `sudo fanctl/remove-macsfancontrol.sh` | One-time cleanup: Macs Fan Control's app and its root helper. Two fan controllers fight, so only one may run. |
+
+Copy the folder to the Mac (`scp -r fanctl douche:`) and run the installer there.
+
 ## GitHub
 
 | Command | What it does |

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.fanctl</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/fanctl</string>
+    <string>daemon</string>
+    <string>--rpm</string><string>0</string>
+    <string>--ramp-from</string><string>75</string>
+    <string>--ramp-to</string><string>95</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/fanctl.log</string>
+  <key>StandardErrorPath</key><string>/var/log/fanctl.log</string>
+</dict>
+</plist>
