@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# cratestats - Track crates.io downloads for all of a user's crates, with daily deltas
+#
+# Usage:
+#   cratestats                       # crates of the user in the config (default: jfarcand)
+#   cratestats -u <login>            # crates of another crates.io user
+#   cratestats <crate> [<crate>...]  # only these crates
+#   cratestats -w [SECONDS]          # watch mode, refresh every N seconds (default 21600)
+#
+# Config file: ~/.config/cratestats/user          (the crates.io login, one line)
+# History:     ~/.config/cratestats/history.json
+
+set -euo pipefail
+
+# ── Parse flags ──────────────────────────────────────────────────
+WATCH=false
+WATCH_INTERVAL=21600  # default 6 hours
+USER_ARG=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)
+      WATCH=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        WATCH_INTERVAL="$2"
+        shift
+      fi
+      shift
+      ;;
+    -u|--user)
+      USER_ARG="${2:?-u needs a crates.io login}"
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,11p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+CONFIG_DIR="${HOME}/.config/cratestats"
+USER_CONF="${CONFIG_DIR}/user"
+HISTORY_FILE="${CONFIG_DIR}/history.json"
+API="https://crates.io/api/v1"
+# crates.io's crawler policy: identify yourself, and at most one request per second.
+UA="cratestats (https://github.com/jfarcand/zsh_local_extensions)"
+
+# ── Colors & symbols ────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Helpers ──────────────────────────────────────────────────────
+ensure_config_dir() {
+  mkdir -p "${CONFIG_DIR}"
+  [[ -f "${HISTORY_FILE}" ]] || echo '{}' > "${HISTORY_FILE}"
+  [[ -f "${USER_CONF}" ]] || echo "jfarcand" > "${USER_CONF}"
+}
+
+# Requests run inside $(...) subshells, so the "a request already went out"
+# state lives in a file: every request after the first waits one second.
+REQUEST_STAMP=$(mktemp -u "${TMPDIR:-/tmp}/cratestats.XXXXXX")
+trap 'rm -f "${REQUEST_STAMP}"' EXIT
+api() {
+  [[ -e "${REQUEST_STAMP}" ]] && sleep 1
+  : > "${REQUEST_STAMP}"
+  curl -sf -A "${UA}" "${API}/$1"
+}
+
+progress() {
+  [[ -t 2 ]] && printf "\r\033[K${DIM}  %s${RESET}" "$1" >&2
+  return 0
+}
+
+# N days before today (UTC), YYYY-MM-DD; BSD date first, GNU date otherwise.
+days_ago() {
+  date -u -v-"$1"d +%Y-%m-%d 2>/dev/null || date -u -d "$1 days ago" +%Y-%m-%d
+}
+
+# 1234567 -> 1,234,567
+commas() {
+  local n="$1" out=""
+  while (( ${#n} > 3 )); do
+    out=",${n: -3}${out}"
+    n="${n:0:${#n}-3}"
+  done
+  echo "${n}${out}"
+}
+
+# Every crate of a user: name, max_version, downloads, recent_downloads (one JSON object per line).
+list_user_crates() {
+  local login="$1" id page=1 body
+  id=$(api "users/${login}" | jq -r '.user.id // empty') || true
+  if [[ -z "${id}" ]]; then
+    echo "No crates.io user '${login}'." >&2
+    exit 1
+  fi
+  while :; do
+    body=$(api "crates?user_id=${id}&per_page=100&page=${page}")
+    echo "${body}" | jq -c '.crates[] | {name, version: .max_version, downloads, recent: .recent_downloads}'
+    [[ $(echo "${body}" | jq '.crates | length') -lt 100 ]] && break
+    page=$(( page + 1 ))
+  done
+}
+
+fetch_crate() {
+  api "crates/$1" | jq -c '.crate | {name, version: .max_version, downloads, recent: .recent_downloads}'
+}
+
+# Today, last 7 days and last 90 days from the per-day counts. crates.io updates
+# a crate's total later than these, so a new crate can read 0 there all day.
+daily_sums() {
+  local name="$1" today week_start
+  today=$(days_ago 0)
+  week_start=$(days_ago 6)
+  api "crates/${name}/downloads" | jq -c --arg t "${today}" --arg w "${week_start}" '
+    [(.version_downloads // [])[], (.meta.extra_downloads // [])[]] as $d
+    | {today: ([$d[] | select(.date == $t) | .downloads] | add // 0),
+       week:  ([$d[] | select(.date >= $w) | .downloads] | add // 0),
+       days90: ([$d[] | .downloads] | add // 0)}'
+}
+
+get_previous_total() {
+  local name="$1" today="$2" entry
+  entry=$(jq -c --arg k "${name}" '.[$k] // empty' "${HISTORY_FILE}")
+  [[ -z "${entry}" ]] && return 0
+  if [[ $(echo "${entry}" | jq -r '.current.date') == "${today}" ]]; then
+    echo "${entry}" | jq -r '.previous // empty | "\(.total) \(.date)"'
+  else
+    echo "${entry}" | jq -r '.current | "\(.total) \(.date)"'
+  fi
+}
+
+save_today() {
+  local name="$1" total="$2" today="$3" tmp
+  tmp=$(mktemp)
+  jq --arg k "${name}" --argjson t "${total}" --arg d "${today}" '
+    .[$k] as $e
+    | if $e == null then .[$k] = {current: {total: $t, date: $d}}
+      elif $e.current.date == $d then .[$k].current = {total: $t, date: $d}
+      else .[$k] = {previous: $e.current, current: {total: $t, date: $d}}
+      end' "${HISTORY_FILE}" > "${tmp}" && mv "${tmp}" "${HISTORY_FILE}"
+}
+
+format_delta() {
+  local current="$1" previous="$2"
+  if [[ -z "${previous}" ]]; then
+    printf "${DIM}%-8s${RESET}" "new"
+    return
+  fi
+  local diff=$(( current - previous ))
+  if (( diff > 0 )); then
+    printf "${GREEN}%-8s${RESET}" "+$(commas "${diff}")"
+  elif (( diff < 0 )); then
+    printf "${RED}%-8s${RESET}" "${diff}"
+  else
+    printf "${DIM}%-8s${RESET}" "0"
+  fi
+}
+
+line() {
+  local left="$1" mid="$2" right="$3" w="$4" i
+  printf "%s" "${left}"
+  for (( i = 0; i < w + 2; i++ )); do printf "─"; done
+  printf "%s──────────" "${mid}"
+  for i in 1 2 3 4 5; do printf "%s──────────" "${mid}"; done
+  printf "%s\n" "${right}"
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+ensure_config_dir
+LOGIN="${USER_ARG:-$(head -1 "${USER_CONF}")}"
+
+display_stats() {
+  local now today
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+  today=$(days_ago 0)
+
+  # ── Collect ────────────────────────────────────────────────────
+  local crates=() rows=() errors=()
+  if [[ $# -gt 0 ]]; then
+    local c
+    for c in "$@"; do
+      progress "looking up ${c}…"
+      crates+=("$(fetch_crate "${c}" || echo "{\"name\":\"${c}\",\"error\":true}")")
+    done
+  else
+    progress "listing ${LOGIN}'s crates…"
+    while IFS= read -r c; do crates+=("${c}"); done < <(list_user_crates "${LOGIN}")
+  fi
+
+  local i=0 c name sums
+  for c in "${crates[@]}"; do
+    i=$(( i + 1 ))
+    name=$(echo "${c}" | jq -r '.name')
+    if [[ $(echo "${c}" | jq -r '.error // false') == true ]]; then
+      errors+=("${name}")
+      continue
+    fi
+    progress "downloads ${i}/${#crates[@]}: ${name}"
+    sums=$(daily_sums "${name}" || echo '{"today":0,"week":0,"days90":0}')
+    # Total and 90 days: the larger of crates.io's own figure and the per-day sum.
+    rows+=("$(jq -cn --argjson c "${c}" --argjson s "${sums}" '$c + $s
+      | .total = ([.downloads, .days90] | max)
+      | .d90 = ([(.recent // 0), .days90] | max)')")
+  done
+  progress ""
+  [[ -t 2 ]] && printf "\r\033[K" >&2
+
+  # Most downloaded first.
+  local sorted=()
+  while IFS= read -r c; do sorted+=("${c}"); done < <(
+    printf '%s\n' "${rows[@]+"${rows[@]}"}" | jq -sc 'sort_by(-.total)[]')
+
+  local w=5
+  for c in "${sorted[@]+"${sorted[@]}"}"; do
+    name=$(echo "${c}" | jq -r '.name')
+    (( ${#name} > w )) && w=${#name}
+  done
+
+  # ── Header ─────────────────────────────────────────────────────
+  echo ""
+  if [[ "${WATCH}" == true ]]; then
+    printf "${BOLD}${CYAN}  crates.io Downloads ${RESET}${DIM}%s (${now})  ⟳ every ${WATCH_INTERVAL}s — Ctrl-C to stop${RESET}\n" "${LOGIN}"
+  else
+    printf "${BOLD}${CYAN}  crates.io Downloads ${RESET}${DIM}%s (${now})${RESET}\n" "${LOGIN}"
+  fi
+  echo ""
+  line "┌" "┬" "┐" "${w}"
+  printf "│ ${BOLD}%-${w}s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%-8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%8s${RESET} │\n" \
+    "Crate" "Version" "Total" "Delta" "90 days" "7 days" "Today"
+  line "├" "┼" "┤" "${w}"
+
+  # ── Rows ───────────────────────────────────────────────────────
+  local sum_total=0 sum_delta=0 sum_90=0 sum_7=0 sum_today=0 prev_date="" any_prev=false
+  local version total d90 week tday prev prev_total p_date delta
+  for c in "${sorted[@]+"${sorted[@]}"}"; do
+    read -r name version total d90 week tday < <(echo "${c}" | jq -r '"\(.name) \(.version) \(.total) \(.d90) \(.week) \(.today)"')
+    prev=$(get_previous_total "${name}" "${today}")
+    prev_total="${prev%% *}"
+    p_date="${prev##* }"
+    delta=$(format_delta "${total}" "${prev_total}")
+    if [[ -n "${prev_total}" ]]; then
+      any_prev=true
+      prev_date="${p_date}"
+      sum_delta=$(( sum_delta + total - prev_total ))
+    fi
+    sum_total=$(( sum_total + total )); sum_90=$(( sum_90 + d90 ))
+    sum_7=$(( sum_7 + week )); sum_today=$(( sum_today + tday ))
+
+    # Placeholder crates (0.0.0, a reserved name) are dimmed.
+    local style=""
+    [[ "${version}" == "0.0.0" ]] && style="${DIM}"
+    printf "│ ${style}%-${w}s${RESET} │ ${style}%8s${RESET} │ %8s │ " "${name}" "${version}" "$(commas "${total}")"
+    printf "%b" "${delta}"
+    printf " │ %8s │ %8s │ " "$(commas "${d90}")" "$(commas "${week}")"
+    if (( tday > 0 )); then printf "${GREEN}%8s${RESET} │\n" "$(commas "${tday}")"; else printf "${DIM}%8s${RESET} │\n" "0"; fi
+
+    save_today "${name}" "${total}" "${today}" || true
+  done
+
+  line "├" "┼" "┤" "${w}"
+  local total_delta
+  if [[ "${any_prev}" == true ]]; then total_delta=$(format_delta "${sum_delta}" 0); else total_delta=$(format_delta 0 ""); fi
+  printf "│ ${BOLD}%-${w}s${RESET} │ %8s │ ${BOLD}%8s${RESET} │ " "${#sorted[@]} crates" "" "$(commas "${sum_total}")"
+  printf "%b" "${total_delta}"
+  printf " │ ${BOLD}%8s${RESET} │ ${BOLD}%8s${RESET} │ ${BOLD}%8s${RESET} │\n" "$(commas "${sum_90}")" "$(commas "${sum_7}")" "$(commas "${sum_today}")"
+  line "└" "┴" "┘" "${w}"
+
+  if [[ -n "${prev_date}" ]]; then
+    printf "\n${DIM}  Δ compared to: ${prev_date}. Today and 7 days are UTC days.${RESET}\n"
+  else
+    printf "\n${DIM}  First run — deltas will appear on the next day's run. Today and 7 days are UTC days.${RESET}\n"
+  fi
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    printf "\n${YELLOW}  ⚠ Not found on crates.io: %s${RESET}\n" "${errors[*]}"
+  fi
+  echo ""
+}
+
+# ── Run (once or watch) ─────────────────────────────────────────
+if [[ "${WATCH}" == true ]]; then
+  trap 'printf "\033[?25h\n${DIM}  Stopped.${RESET}\n"; exit 0' INT
+  printf '\033[?25l'
+  while true; do
+    output=$(display_stats "$@" 2>&1)
+    printf '\033[H\033[2J\033[3J' > /dev/tty
+    printf '%s\n' "${output}"
+    sleep "${WATCH_INTERVAL}"
+  done
+else
+  display_stats "$@"
+fi

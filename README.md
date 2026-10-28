@@ -97,6 +97,12 @@ Copy the folder to the Mac (`scp -r fanctl douche:`) and run the installer there
 | `cr` | Create an issue, commit with `Fixes #n`, and push. |
 | `recover_git_history` | Find deleted files or folders in git history and restore them. |
 
+## crates.io
+
+| Command | What it does |
+|---|---|
+| `cratestats` | Downloads of every crate a crates.io user owns (`~/.config/cratestats/user`, default `jfarcand`; `-u <login>` for another, or name crates as arguments): total, delta since the previous day, last 90 days, last 7 days and today (UTC), most downloaded first, placeholder `0.0.0` crates dimmed. Totals come from crates.io's per-day counts when its own total lags, so a crate published today does not read 0. One request per second, as crates.io asks; `-w` refreshes every 6 hours. |
+
 ## dravr
 
 | Command | What it does |
